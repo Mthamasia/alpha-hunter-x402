@@ -1,0 +1,9 @@
+fastapi>=0.110,<1.0
+pydantic>=2.6,<3.0
+uvicorn>=0.29
+python-dotenv>=1.0
+httpx>=0.27
+pytest>=8.0
+# x402 V2 oficial com suporte Algorand (AVM). Versão fixada: a integração usa
+# APIs verificadas nesta versão (x402ResourceServer, payment_middleware, etc.).
+x402-avm[avm,fastapi]==2.0.2

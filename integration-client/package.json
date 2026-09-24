@@ -1,0 +1,24 @@
+{
+  "name": "ahx-x402-integration-client",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 5173 --strictPort",
+    "build": "tsc --noEmit && vite build",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@algorandfoundation/algokit-utils": "10.0.0-alpha.46",
+    "@perawallet/connect": "1.6.1",
+    "@x402/avm": "2.27.0",
+    "@x402/core": "2.27.0",
+    "algosdk": "3.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.2",
+    "typescript": "7.0.2",
+    "vite": "8.3.1",
+    "vitest": "5.0.1"
+  }
+}

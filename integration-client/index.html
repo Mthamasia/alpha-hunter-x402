@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AHX x402 Testnet Client</title>
+    <style>
+      :root { color-scheme: light dark; --bad: #c0392b; --ok: #1e8449; }
+      body { font-family: system-ui, sans-serif; max-width: 860px; margin: 24px auto; padding: 0 16px; background: Canvas; color: CanvasText; }
+      h1 { font-size: 1.3rem; }
+      section { border: 1px solid #8884; border-radius: 8px; padding: 12px 16px; margin: 12px 0; }
+      .banner { background: #f39c1233; border-color: #f39c12; }
+      table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+      td { border-bottom: 1px solid #8883; padding: 4px 6px; word-break: break-all; vertical-align: top; }
+      tr.bad td { color: var(--bad); font-weight: 600; }
+      #errors li { color: var(--bad); }
+      input { width: 100%; box-sizing: border-box; padding: 6px; font-family: monospace; }
+      button { padding: 8px 14px; margin: 4px 4px 4px 0; cursor: pointer; }
+      button:disabled { cursor: not-allowed; opacity: 0.5; }
+      #pay { font-weight: 700; background: var(--ok); color: white; border: 0; border-radius: 6px; }
+      pre { background: #8881; padding: 8px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
+      code, #account { font-family: monospace; word-break: break-all; }
+    </style>
+  </head>
+  <body>
+    <h1>AHX x402 — cliente manual (Algorand TestNet)</h1>
+    <section class="banner">
+      TESTNET apenas. A chave privada permanece na Pera Wallet; esta página nunca pede
+      seed phrase, mnemonic ou private key. Uma tentativa de pagamento por carregamento da página.
+    </section>
+
+    <section>
+      <h2>1. Carteira</h2>
+      <p>Rede exigida: <b>Algorand TestNet</b> (Pera chainId 416002).</p>
+      <button id="connect">Conectar Pera Wallet</button>
+      <button id="disconnect" disabled>Desconectar</button>
+      <p>Endereço conectado: <span id="account">(não conectado)</span></p>
+    </section>
+
+    <section>
+      <h2>2. Investigação</h2>
+      <label for="mint">Solana mint</label>
+      <input id="mint" maxlength="44" value="So11111111111111111111111111111111111111112" />
+      <button id="quote" disabled>Solicitar cotação (sem pagar)</button>
+      <p id="quote-status"></p>
+    </section>
+
+    <section>
+      <h2>3. Requisitos de pagamento (PAYMENT-REQUIRED)</h2>
+      <table>
+        <tbody id="summary-body"></tbody>
+      </table>
+      <ul id="errors"></ul>
+      <button id="pay" disabled>PAY 0.05 USDC TESTNET</button>
+      <p id="pay-status"></p>
+    </section>
+
+    <section>
+      <h2>4. Resultado</h2>
+      <p>HTTP final: <code id="http-final"></code></p>
+      <p>Transaction ID: <span id="txid"></span></p>
+      <p>Erro: <code id="pay-error"></code></p>
+      <h3>PAYMENT-RESPONSE (settlement)</h3>
+      <pre id="settlement"></pre>
+      <h3>Resultado da API</h3>
+      <pre id="api-result"></pre>
+    </section>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
