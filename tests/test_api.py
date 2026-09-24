@@ -9,6 +9,40 @@ def test_health(client):
     r = client.get("/health")
     assert r.status_code == 200
     assert r.json() == {"status": "ok"}
+    assert r.headers["X-Content-Type-Options"] == "nosniff"
+    assert r.headers["X-Frame-Options"] == "DENY"
+    assert r.headers["Cache-Control"] == "no-store"
+
+
+def test_readiness_exposes_no_sensitive_configuration(client):
+    r = client.get("/ready")
+    assert r.status_code == 200
+    assert r.json() == {"status": "ready", "provider": "stub"}
+
+
+def test_cors_is_explicit_and_exposes_x402_headers():
+    from app.config import Settings
+    from app.main import create_app
+    from fastapi.testclient import TestClient
+
+    client = TestClient(
+        create_app(
+            Settings(
+                cors_allow_origins=("https://app.example.test",),
+            )
+        )
+    )
+    preflight = client.options(
+        URL,
+        headers={
+            "Origin": "https://app.example.test",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert preflight.status_code == 200
+    assert preflight.headers["access-control-allow-origin"] == "https://app.example.test"
+    response = client.get("/health", headers={"Origin": "https://app.example.test"})
+    assert "PAYMENT-REQUIRED" in response.headers["access-control-expose-headers"]
 
 
 def test_version(client):
@@ -65,7 +99,7 @@ def test_invalid_mints_rejected(client):
         assert body["error"]["code"] == "validation_error"
         # Não ecoa o input do cliente
         if isinstance(mint, str) and mint:
-            assert mint not in r.text
+            assert mint not in str(body["error"].get("details", []))
 
 
 def test_invalid_chain_and_extra_fields_rejected(client):

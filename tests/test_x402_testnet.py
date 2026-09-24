@@ -114,6 +114,16 @@ def test_requirements_are_real_x402_v2():
     assert pr.accepts[0].max_timeout_seconds == 300
 
 
+def test_requirements_include_bazaar_discovery_metadata():
+    client, _ = make_x402_client()
+    metadata = get_requirements(client).extensions["bazaar"]["info"]
+    assert metadata["input"]["type"] == "http"
+    assert metadata["input"]["method"] == "POST"
+    assert metadata["output"]["type"] == "json"
+    assert "x402-global-challenge" in metadata["tags"]
+    assert "mint" in metadata["input"]["body"]
+
+
 def test_requirements_indicate_algorand_testnet():
     client, _ = make_x402_client()
     req = get_requirements(client).accepts[0]
@@ -150,6 +160,11 @@ def test_other_routes_are_not_paywalled():
     assert client.get("/health").status_code == 200
     assert client.get("/version").json()["payment_mode"] == "x402-testnet"
     assert fac.verify_calls == 0
+
+
+def test_public_base_url_is_used_for_discovery_resource():
+    client, _ = make_x402_client(public_base_url="https://api.example.test")
+    assert get_requirements(client).resource.url == "https://api.example.test/v1/token/investigate"
 
 
 # ---------------------------------------------------------------- verify / settle (fake)
@@ -279,6 +294,33 @@ def test_testnet_network_aliases_accepted():
 
 def test_disabled_mode_does_not_require_pay_to():
     assert Settings(payment_mode="disabled").pay_to == ""
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"app_env": "production"},
+        {
+            "app_env": "production",
+            "public_base_url": "http://api.example.test",
+            "cors_allow_origins": ("https://app.example.test",),
+        },
+        {
+            "app_env": "production",
+            "public_base_url": "https://api.example.test",
+        },
+        {
+            "app_env": "production",
+            "public_base_url": "https://api.example.test",
+            "cors_allow_origins": ("https://app.example.test",),
+            "intelligence_provider": "alpha_hunter",
+            "ahx_bridge_service_token": "test-token",
+        },
+    ],
+)
+def test_production_configuration_fails_closed(overrides):
+    with pytest.raises(ConfigError):
+        Settings(**overrides)
 
 
 # ---------------------------------------------------------------- sem chaves / sem segredos

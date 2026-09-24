@@ -19,6 +19,7 @@ from x402.mechanisms.avm.constants import ALGORAND_TESTNET_CAIP2, USDC_TESTNET_A
 from x402.mechanisms.avm.exact.register import register_exact_avm_server
 
 from app.config import USDC_DECIMALS, Settings
+from app.discovery import bazaar_extension
 
 INVESTIGATE_ROUTE = "POST /v1/token/investigate"
 FACILITATOR_TIMEOUT_SECONDS = 15.0
@@ -28,6 +29,11 @@ MAX_TIMEOUT_SECONDS = 300
 def build_routes(settings: Settings) -> dict[str, Any]:
     return {
         INVESTIGATE_ROUTE: {
+            **(
+                {"resource": f"{settings.public_base_url}/v1/token/investigate"}
+                if settings.public_base_url
+                else {}
+            ),
             "accepts": {
                 "scheme": "exact",
                 "network": ALGORAND_TESTNET_CAIP2,
@@ -43,6 +49,7 @@ def build_routes(settings: Settings) -> dict[str, Any]:
             },
             "description": "AHX on-chain token investigation",
             "mimeType": "application/json",
+            "extensions": bazaar_extension(settings),
         }
     }
 

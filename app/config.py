@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 
 PAYMENT_MODES = ("disabled", "test", "x402-testnet")
 INTELLIGENCE_PROVIDERS = ("stub", "alpha_hunter")
+APP_ENVS = ("development", "test", "production")
 DEFAULT_FACILITATOR_URL = "https://facilitator.goplausible.xyz"
 DEFAULT_AHX_BRIDGE_URL = "http://127.0.0.1:8787"
 DEFAULT_AHX_BRIDGE_TIMEOUT_SECONDS = 3.0
@@ -39,8 +40,12 @@ class Settings:
     ahx_bridge_url: str = DEFAULT_AHX_BRIDGE_URL
     ahx_bridge_service_token: str = ""
     ahx_bridge_timeout_seconds: float = DEFAULT_AHX_BRIDGE_TIMEOUT_SECONDS
+    public_base_url: str = ""
+    cors_allow_origins: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        if self.app_env not in APP_ENVS:
+            raise ConfigError(f"APP_ENV inválido: {self.app_env!r}. Use um de {APP_ENVS}.")
         if self.payment_mode not in PAYMENT_MODES:
             raise ConfigError(
                 f"PAYMENT_MODE inválido: {self.payment_mode!r}. Use um de {PAYMENT_MODES}."
@@ -56,6 +61,10 @@ class Settings:
             raise ConfigError("AHX_BRIDGE_TIMEOUT_SECONDS deve ser maior que zero.")
         if self.intelligence_provider == "alpha_hunter":
             self._validate_ahx_bridge()
+        self._validate_public_base_url()
+        self._validate_cors_origins()
+        if self.app_env == "production":
+            self._validate_production()
         # Nesta fase Mainnet é proibida.
         if "mainnet" in self.x402_network.lower():
             raise ConfigError("X402_NETWORK=mainnet não é permitido nesta fase.")
@@ -90,6 +99,32 @@ class Settings:
         if url.username or url.password:
             raise ConfigError("AHX_BRIDGE_URL não pode conter credenciais.")
 
+    def _validate_public_base_url(self) -> None:
+        if not self.public_base_url:
+            return
+        url = urlparse(self.public_base_url)
+        if url.scheme != "https" or not url.hostname or url.username or url.password:
+            raise ConfigError("PUBLIC_BASE_URL deve ser uma URL https válida sem credenciais.")
+        if url.query or url.fragment:
+            raise ConfigError("PUBLIC_BASE_URL não pode incluir query ou fragment.")
+
+    def _validate_cors_origins(self) -> None:
+        for origin in self.cors_allow_origins:
+            url = urlparse(origin)
+            if url.scheme != "https" or not url.hostname or url.path not in ("", "/"):
+                raise ConfigError("CORS_ALLOW_ORIGINS aceita somente origins https válidas.")
+
+    def _validate_production(self) -> None:
+        if not self.public_base_url:
+            raise ConfigError("PUBLIC_BASE_URL é obrigatório em APP_ENV=production.")
+        if not self.cors_allow_origins:
+            raise ConfigError("CORS_ALLOW_ORIGINS é obrigatório em APP_ENV=production.")
+        bridge = urlparse(self.ahx_bridge_url)
+        if bridge.hostname in ("localhost", "127.0.0.1", "::1"):
+            raise ConfigError("AHX_BRIDGE_URL não pode apontar para localhost em produção.")
+        if self.intelligence_provider == "alpha_hunter" and bridge.scheme != "https":
+            raise ConfigError("AHX_BRIDGE_URL deve usar https em produção.")
+
     @property
     def price_atomic(self) -> int:
         """PRICE_USD em unidades mínimas de USDC (6 casas), sem arredondamento."""
@@ -114,8 +149,13 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         timeout = float(raw_timeout)
     except ValueError as exc:
         raise ConfigError("AHX_BRIDGE_TIMEOUT_SECONDS deve ser numérico.") from exc
+    cors_origins = tuple(
+        origin.strip().rstrip("/")
+        for origin in os.getenv("CORS_ALLOW_ORIGINS", "").split(",")
+        if origin.strip()
+    )
     return Settings(
-        app_env=os.getenv("APP_ENV", "development").strip(),
+        app_env=os.getenv("APP_ENV", "development").strip().lower(),
         payment_mode=os.getenv("PAYMENT_MODE", "disabled").strip().lower(),
         price_usd=price,
         pay_to=os.getenv("PAY_TO", "").strip(),
@@ -129,4 +169,6 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         ),
         ahx_bridge_service_token=os.getenv("AHX_BRIDGE_SERVICE_TOKEN", ""),
         ahx_bridge_timeout_seconds=timeout,
+        public_base_url=os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/"),
+        cors_allow_origins=cors_origins,
     )

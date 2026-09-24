@@ -8,6 +8,7 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.middleware.cors import CORSMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app import SCHEMA_VERSION, __version__
@@ -52,6 +53,15 @@ def create_app(
     app.state.settings = settings
     app.state.provider = provider
     app.state.gate = gate
+    if settings.cors_allow_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(settings.cors_allow_origins),
+            allow_credentials=False,
+            allow_methods=["GET", "POST"],
+            allow_headers=["Content-Type", "PAYMENT-SIGNATURE"],
+            expose_headers=["PAYMENT-REQUIRED", "PAYMENT-RESPONSE", "X-Request-ID"],
+        )
 
     if settings.payment_mode == "x402-testnet":
         from app.payments.x402_avm import build_x402_middleware
@@ -82,6 +92,11 @@ def create_app(
                 return _error(413, "payload_too_large", "request body too large", _rid(request))
         response = await call_next(request)
         response.headers["X-Request-ID"] = request.state.request_id
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+        response.headers["Cache-Control"] = "no-store"
         # Loga apenas metadados; nunca headers/body (podem conter provas de pagamento).
         logger.info("%s %s -> %s rid=%s", request.method, request.url.path,
                     response.status_code, request.state.request_id)
@@ -118,6 +133,10 @@ def create_app(
     @app.get("/health")
     def health():
         return {"status": "ok"}
+
+    @app.get("/ready")
+    def ready():
+        return {"status": "ready", "provider": provider.name}
 
     @app.get("/version")
     def version():
