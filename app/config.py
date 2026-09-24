@@ -13,14 +13,15 @@ from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
-PAYMENT_MODES = ("disabled", "test", "x402-testnet")
+PAYMENT_MODES = ("disabled", "test", "x402-testnet", "x402-mainnet")
 INTELLIGENCE_PROVIDERS = ("stub", "alpha_hunter")
 APP_ENVS = ("development", "test", "production")
 DEFAULT_FACILITATOR_URL = "https://facilitator.goplausible.xyz"
 DEFAULT_AHX_BRIDGE_URL = "http://127.0.0.1:8787"
 DEFAULT_AHX_BRIDGE_TIMEOUT_SECONDS = 3.0
-# Aliases aceitos em X402_NETWORK para Algorand Testnet (modo x402-testnet).
+# Aliases aceitos somente nos perfis x402 correspondentes.
 ALGORAND_TESTNET_ALIASES = ("testnet", "algorand-testnet")
+ALGORAND_MAINNET_ALIASES = ("mainnet", "algorand-mainnet")
 USDC_DECIMALS = 6
 
 
@@ -42,6 +43,7 @@ class Settings:
     ahx_bridge_timeout_seconds: float = DEFAULT_AHX_BRIDGE_TIMEOUT_SECONDS
     public_base_url: str = ""
     cors_allow_origins: tuple[str, ...] = ()
+    enable_mainnet_x402: bool = False
 
     def __post_init__(self) -> None:
         if self.app_env not in APP_ENVS:
@@ -65,11 +67,12 @@ class Settings:
         self._validate_cors_origins()
         if self.app_env == "production":
             self._validate_production()
-        # Nesta fase Mainnet é proibida.
-        if "mainnet" in self.x402_network.lower():
-            raise ConfigError("X402_NETWORK=mainnet não é permitido nesta fase.")
+        if self.payment_mode != "x402-mainnet" and "mainnet" in self.x402_network.lower():
+            raise ConfigError("X402_NETWORK=mainnet exige PAYMENT_MODE=x402-mainnet.")
         if self.payment_mode == "x402-testnet":
             self._validate_x402_testnet()
+        if self.payment_mode == "x402-mainnet":
+            self._validate_x402_mainnet()
 
     def _validate_x402_testnet(self) -> None:
         from algosdk.encoding import is_valid_address
@@ -87,6 +90,29 @@ class Settings:
         if url.username or url.password:
             raise ConfigError("X402_FACILITATOR_URL não pode conter credenciais.")
         self.price_atomic  # valida que o preço é representável em USDC
+
+    def _validate_x402_mainnet(self) -> None:
+        from algosdk.encoding import is_valid_address
+        from x402.mechanisms.avm import ALGORAND_MAINNET_CAIP2
+
+        if not self.enable_mainnet_x402:
+            raise ConfigError(
+                "ENABLE_MAINNET_X402=true é obrigatório em PAYMENT_MODE=x402-mainnet."
+            )
+        if self.app_env != "production":
+            raise ConfigError("PAYMENT_MODE=x402-mainnet exige APP_ENV=production.")
+        if self.intelligence_provider != "alpha_hunter":
+            raise ConfigError("PAYMENT_MODE=x402-mainnet exige INTELLIGENCE_PROVIDER=alpha_hunter.")
+        if not self.pay_to:
+            raise ConfigError("PAY_TO é obrigatório em PAYMENT_MODE=x402-mainnet.")
+        if not is_valid_address(self.pay_to):
+            raise ConfigError("PAY_TO não é um endereço Algorand válido.")
+        if self.x402_network not in (*ALGORAND_MAINNET_ALIASES, ALGORAND_MAINNET_CAIP2):
+            raise ConfigError("X402_NETWORK deve indicar Algorand Mainnet em x402-mainnet.")
+        url = urlparse(self.x402_facilitator_url)
+        if url.scheme != "https" or not url.hostname or url.username or url.password:
+            raise ConfigError("X402_FACILITATOR_URL deve ser uma URL https válida sem credenciais.")
+        self.price_atomic
 
     def _validate_ahx_bridge(self) -> None:
         if not self.ahx_bridge_service_token:
@@ -133,6 +159,32 @@ class Settings:
             raise ConfigError("PRICE_USD tem mais de 6 casas decimais.")
         return int(atomic)
 
+    @property
+    def x402_caip2(self) -> str:
+        from x402.mechanisms.avm import (
+            ALGORAND_MAINNET_CAIP2,
+            ALGORAND_TESTNET_CAIP2,
+        )
+
+        if self.payment_mode == "x402-mainnet":
+            return ALGORAND_MAINNET_CAIP2
+        if self.payment_mode == "x402-testnet":
+            return ALGORAND_TESTNET_CAIP2
+        raise ConfigError("Perfil x402 não está ativo.")
+
+    @property
+    def x402_usdc_asa_id(self) -> int:
+        from x402.mechanisms.avm import (
+            USDC_MAINNET_ASA_ID,
+            USDC_TESTNET_ASA_ID,
+        )
+
+        if self.payment_mode == "x402-mainnet":
+            return USDC_MAINNET_ASA_ID
+        if self.payment_mode == "x402-testnet":
+            return USDC_TESTNET_ASA_ID
+        raise ConfigError("Perfil x402 não está ativo.")
+
 
 def load_settings(env_file: str | None = ".env") -> Settings:
     if env_file:
@@ -154,6 +206,9 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         for origin in os.getenv("CORS_ALLOW_ORIGINS", "").split(",")
         if origin.strip()
     )
+    raw_mainnet = os.getenv("ENABLE_MAINNET_X402", "false").strip().lower()
+    if raw_mainnet not in ("true", "false"):
+        raise ConfigError("ENABLE_MAINNET_X402 deve ser true ou false.")
     return Settings(
         app_env=os.getenv("APP_ENV", "development").strip().lower(),
         payment_mode=os.getenv("PAYMENT_MODE", "disabled").strip().lower(),
@@ -171,4 +226,5 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         ahx_bridge_timeout_seconds=timeout,
         public_base_url=os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/"),
         cors_allow_origins=cors_origins,
+        enable_mainnet_x402=raw_mainnet == "true",
     )

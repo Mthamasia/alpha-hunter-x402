@@ -63,7 +63,7 @@ def create_app(
             expose_headers=["PAYMENT-REQUIRED", "PAYMENT-RESPONSE", "X-Request-ID"],
         )
 
-    if settings.payment_mode == "x402-testnet":
+    if settings.payment_mode in ("x402-testnet", "x402-mainnet"):
         from app.payments.x402_avm import build_x402_middleware
 
         x402_mw = build_x402_middleware(settings, facilitator_client)

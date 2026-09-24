@@ -85,7 +85,7 @@ class PaymentGate:
     def verify(self, header_value: str | None, resource: str) -> PaymentDecision:
         if self.mode == "disabled":
             return PaymentDecision(paid=False, simulated=False)
-        if self.mode == "x402-testnet":
+        if self.mode in ("x402-testnet", "x402-mainnet"):
             # Verify/settle feitos pela middleware oficial x402 (app/payments/x402_avm.py)
             # antes de a requisição chegar aqui.
             return PaymentDecision(paid=True, simulated=False)

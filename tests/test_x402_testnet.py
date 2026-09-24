@@ -12,7 +12,12 @@ import pytest
 from fastapi.testclient import TestClient
 from x402.http import decode_payment_required_header, decode_payment_response_header
 from x402.http.utils import encode_payment_signature_header
-from x402.mechanisms.avm.constants import ALGORAND_TESTNET_CAIP2, TESTNET_GENESIS_HASH
+from x402.mechanisms.avm import (
+    ALGORAND_MAINNET_CAIP2,
+    ALGORAND_TESTNET_CAIP2,
+    USDC_MAINNET_ASA_ID,
+)
+from x402.mechanisms.avm.constants import TESTNET_GENESIS_HASH
 from x402.schemas import (
     PaymentPayload,
     SettleResponse,
@@ -33,15 +38,23 @@ RECEIVER = "A5D55SSWZFKTMSZ2CCCOMDVM3J4ROZT2Z2KAKXM26WQEVSLVSM3ZEEPKMQ"
 FACILITATOR = "https://facilitator.goplausible.xyz"
 USDC_TESTNET = "10458941"
 EXPECTED_CAIP2 = "algorand:SGO1GKSzyE7IEPItTxCByw9x8FmnrCDexi9/cOUJOiI="
+USDC_MAINNET = str(USDC_MAINNET_ASA_ID)
 
 
 class FakeFacilitator:
     """Facilitator em memória. Registra chamadas; nunca toca a rede."""
 
-    def __init__(self, valid: bool = True, settle_ok: bool = True, supported: bool = True):
+    def __init__(
+        self,
+        valid: bool = True,
+        settle_ok: bool = True,
+        supported: bool = True,
+        network: str = ALGORAND_TESTNET_CAIP2,
+    ):
         self.valid = valid
         self.settle_ok = settle_ok
         self.supported = supported
+        self.network = network
         self.verify_calls = 0
         self.settle_calls = 0
 
@@ -49,7 +62,7 @@ class FakeFacilitator:
         if not self.supported:
             raise ConnectionError("facilitator unreachable")
         return SupportedResponse(
-            kinds=[SupportedKind(x402_version=2, scheme="exact", network=ALGORAND_TESTNET_CAIP2)]
+            kinds=[SupportedKind(x402_version=2, scheme="exact", network=self.network)]
         )
 
     async def verify(self, payload, requirements) -> VerifyResponse:
@@ -64,7 +77,7 @@ class FakeFacilitator:
             success=self.settle_ok,
             error_reason=None if self.settle_ok else "settle_failed",
             transaction="FAKE-TX-ID" if self.settle_ok else "",
-            network=ALGORAND_TESTNET_CAIP2,
+            network=self.network,
         )
 
 
@@ -77,6 +90,33 @@ def x402_settings(**overrides) -> Settings:
 def make_x402_client(facilitator=None, **overrides):
     facilitator = facilitator or FakeFacilitator()
     app = create_app(x402_settings(**overrides), facilitator_client=facilitator)
+    return TestClient(app, raise_server_exceptions=False), facilitator
+
+
+def mainnet_x402_settings(**overrides) -> Settings:
+    base = dict(
+        app_env="production",
+        payment_mode="x402-mainnet",
+        enable_mainnet_x402=True,
+        pay_to=RECEIVER,
+        x402_network=ALGORAND_MAINNET_CAIP2,
+        x402_facilitator_url=FACILITATOR,
+        intelligence_provider="alpha_hunter",
+        ahx_bridge_url="https://bridge.example.test",
+        ahx_bridge_service_token="test-token",
+        public_base_url="https://api.example.test",
+        cors_allow_origins=("https://app.example.test",),
+    )
+    base.update(overrides)
+    return Settings(**base)
+
+
+def make_mainnet_x402_client(facilitator=None, **overrides):
+    facilitator = facilitator or FakeFacilitator(network=ALGORAND_MAINNET_CAIP2)
+    app = create_app(
+        mainnet_x402_settings(**overrides),
+        facilitator_client=facilitator,
+    )
     return TestClient(app, raise_server_exceptions=False), facilitator
 
 
@@ -116,12 +156,15 @@ def test_requirements_are_real_x402_v2():
 
 def test_requirements_include_bazaar_discovery_metadata():
     client, _ = make_x402_client()
-    metadata = get_requirements(client).extensions["bazaar"]["info"]
+    bazaar = get_requirements(client).extensions["bazaar"]
+    metadata = bazaar["info"]
     assert metadata["input"]["type"] == "http"
     assert metadata["input"]["method"] == "POST"
     assert metadata["output"]["type"] == "json"
     assert "x402-global-challenge" in metadata["tags"]
     assert "mint" in metadata["input"]["body"]
+    assert bazaar["schema"]["$schema"] == "https://json-schema.org/draft/2020-12/schema"
+    assert "body" in bazaar["schema"]["properties"]["input"]["properties"]
 
 
 def test_requirements_indicate_algorand_testnet():
@@ -147,6 +190,15 @@ def test_requirements_indicate_amount_50000():
 def test_requirements_indicate_configured_receiver():
     client, _ = make_x402_client()
     assert get_requirements(client).accepts[0].pay_to == RECEIVER
+
+
+def test_mainnet_requirements_use_official_network_and_usdc():
+    client, fac = make_mainnet_x402_client()
+    req = get_requirements(client).accepts[0]
+    assert req.network == ALGORAND_MAINNET_CAIP2
+    assert req.asset == USDC_MAINNET
+    assert req.extra["genesisId"] == "mainnet-v1.0"
+    assert fac.verify_calls == fac.settle_calls == 0
 
 
 def test_invalid_input_without_payment_still_402():
@@ -280,7 +332,7 @@ def test_simulated_test_mode_still_works(paid_client):
         {"payment_mode": "x402-mainnet"},
     ],
     ids=["no-payto", "bad-payto", "bad-checksum", "mainnet-alias", "mainnet", "mainnet-caip2",
-         "wrong-chain", "http-url", "url-creds", "bad-url", "too-precise", "zero-price", "x402-mainnet"],
+         "wrong-chain", "http-url", "url-creds", "bad-url", "too-precise", "zero-price", "x402-mainnet-disabled"],
 )
 def test_invalid_config_fails_safely(overrides):
     with pytest.raises(ConfigError):
@@ -290,6 +342,22 @@ def test_invalid_config_fails_safely(overrides):
 def test_testnet_network_aliases_accepted():
     for net in ("testnet", "algorand-testnet", EXPECTED_CAIP2):
         assert x402_settings(x402_network=net).price_atomic == 50000
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"x402_network": ALGORAND_TESTNET_CAIP2},
+        {"x402_network": "testnet"},
+        {"x402_network": "algorand-testnet"},
+        {"enable_mainnet_x402": False},
+        {"app_env": "development"},
+        {"intelligence_provider": "stub"},
+    ],
+)
+def test_mainnet_rejects_mismatched_or_non_explicit_profile(overrides):
+    with pytest.raises(ConfigError):
+        mainnet_x402_settings(**overrides)
 
 
 def test_disabled_mode_does_not_require_pay_to():

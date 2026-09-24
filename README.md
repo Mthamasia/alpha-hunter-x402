@@ -85,7 +85,7 @@ keys, mnemonics, or bridge tokens in versioned files.
 
 | Variable | Purpose |
 | --- | --- |
-| `PAYMENT_MODE` | `disabled`, `test`, or `x402-testnet`. |
+| `PAYMENT_MODE` | `disabled`, `test`, `x402-testnet`, or explicit `x402-mainnet`. |
 | `PRICE_USD` | Decimal price; `0.05` is `50000` USDC atomic units. |
 | `PAY_TO` | Required Algorand receiver in real x402 Testnet mode. |
 | `X402_NETWORK` | Testnet alias or Testnet CAIP-2 only. |
@@ -95,6 +95,7 @@ keys, mnemonics, or bridge tokens in versioned files.
 | `AHX_BRIDGE_SERVICE_TOKEN` | Required only for `alpha_hunter`; never log it. |
 | `PUBLIC_BASE_URL` | Required HTTPS public API origin in production. |
 | `CORS_ALLOW_ORIGINS` | Required comma-separated HTTPS browser origins in production. |
+| `ENABLE_MAINNET_X402` | Must be exactly `true` before `x402-mainnet` is accepted. |
 
 `APP_ENV=production` fails closed unless `PUBLIC_BASE_URL` and
 `CORS_ALLOW_ORIGINS` are configured. It rejects a localhost bridge and requires
@@ -150,13 +151,19 @@ bridge or the Alpha Hunter database to the internet.
 
 ## Mainnet status
 
-Mainnet settlement is deliberately **not enabled**. The pinned Python
-`x402-avm==2.0.2` package provides the verified Testnet AVM constants and
-registration used by this service but does not expose a verified Mainnet AVM
-registration in this project. The expected Mainnet USDC ASA (`31566704`) is
-documented for future review only; no configuration can silently activate it.
-A dependency/protocol upgrade, re-audit, explicit Mainnet configuration, and a
-separate human-approved test plan are required before enabling Mainnet.
+The server supports the official `x402-avm==2.0.2` Mainnet AVM profile with
+`ALGORAND_MAINNET_CAIP2` and `USDC_MAINNET_ASA_ID` (`31566704`). It is never a
+default or fallback: activating `x402-mainnet` requires all of:
+
+- `APP_ENV=production`;
+- `ENABLE_MAINNET_X402=true`;
+- `INTELLIGENCE_PROVIDER=alpha_hunter`;
+- a non-localhost HTTPS Alpha Hunter bridge plus its service token;
+- explicit HTTPS public API URL and CORS origins; and
+- an HTTPS facilitator.
+
+The included browser client remains Testnet-only. No Mainnet client, deployment,
+payment, or settlement test is provided or performed by this repository.
 
 ## Disclaimer
 
