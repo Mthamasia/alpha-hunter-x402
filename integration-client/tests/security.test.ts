@@ -39,6 +39,12 @@ describe("ausência de chaves / mnemonic / storage", () => {
 describe("pagamento só com ação explícita / somente Testnet", () => {
   const main = read(join(SRC, "main.ts"));
 
+  it("proxy padrão aponta para o Railway público", () => {
+    expect(read(join(ROOT, "vite.config.ts"))).toContain(
+      'process.env.AHX_API_URL ?? "https://alpha-hunter-x402-production.up.railway.app"',
+    );
+  });
+
   it("Pera travada em TestNet (chainId 416002)", () => {
     expect(read(join(SRC, "config.ts"))).toMatch(/PERA_TESTNET_CHAIN_ID = 416002/);
     expect(main).toMatch(/new PeraWalletConnect\(\{ chainId: PERA_TESTNET_CHAIN_ID/);

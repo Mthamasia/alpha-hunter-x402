@@ -36,17 +36,13 @@ Os spend controls do `x402Client` limitam o ASA 10458941 a 50000 unidades como s
 ## Como rodar
 
 ```bash
-# 1) resource server (na raiz do repositório), modo x402-testnet
-PAYMENT_MODE=x402-testnet PAY_TO=A5D55SSWZFKTMSZ2CCCOMDVM3J4ROZT2Z2KAKXM26WQEVSLVSM3ZEEPKMQ \
-  .venv/Scripts/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
-
-# 2) cliente
+# cliente (o proxy /api usa o Railway público por padrão)
 cd integration-client
 npm install
-npm run dev          # http://127.0.0.1:5173  (proxy /api -> http://127.0.0.1:8000)
+npm run dev          # http://127.0.0.1:5173
 ```
 
-O proxy do Vite deixa API e página na mesma origem, então o servidor não precisa de CORS e os headers `PAYMENT-*` ficam legíveis. Para usar outra porta ou host na API, defina `AHX_API_URL`.
+O proxy do Vite deixa API e página na mesma origem, então os headers `PAYMENT-*` ficam legíveis. O destino padrão é `https://alpha-hunter-x402-production.up.railway.app`; para desenvolvimento local, defina `AHX_API_URL`.
 
 Na Pera Wallet (celular), ative **Developer Settings → Node Settings → TestNet** antes de conectar.
 
