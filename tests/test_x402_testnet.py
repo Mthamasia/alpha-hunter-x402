@@ -2,7 +2,7 @@
 
 Nenhum teste fala com o facilitator real nem com a blockchain: usamos um
 facilitator falso que implementa o protocolo FacilitatorClient da biblioteca.
-Nenhum fundo é movimentado e nenhuma chave privada é usada.
+Nenhum fundo Ã© movimentado e nenhuma chave privada Ã© usada.
 """
 
 from decimal import Decimal
@@ -33,7 +33,7 @@ from tests.conftest import NetworkBlocked, WSOL_MINT
 
 URL = "/v1/token/investigate"
 REQ = {"chain": "solana", "mint": WSOL_MINT}
-# Endereço público de recebimento (não é segredo).
+# EndereÃ§o pÃºblico de recebimento (nÃ£o Ã© segredo).
 RECEIVER = "A5D55SSWZFKTMSZ2CCCOMDVM3J4ROZT2Z2KAKXM26WQEVSLVSM3ZEEPKMQ"
 FACILITATOR = "https://facilitator.goplausible.xyz"
 USDC_TESTNET = "10458941"
@@ -42,7 +42,7 @@ USDC_MAINNET = str(USDC_MAINNET_ASA_ID)
 
 
 class FakeFacilitator:
-    """Facilitator em memória. Registra chamadas; nunca toca a rede."""
+    """Facilitator em memÃ³ria. Registra chamadas; nunca toca a rede."""
 
     def __init__(
         self,
@@ -127,7 +127,7 @@ def get_requirements(client: TestClient):
 
 
 def fake_signature_header(requirements) -> str:
-    # Payload sintético: só o facilitator falso o "verifica". Não é uma transação assinada.
+    # Payload sintÃ©tico: sÃ³ o facilitator falso o "verifica". NÃ£o Ã© uma transaÃ§Ã£o assinada.
     payload = PaymentPayload(payload={"paymentGroup": [], "paymentIndex": 0}, accepted=requirements)
     return encode_payment_signature_header(payload)
 
@@ -173,6 +173,7 @@ def test_requirements_indicate_algorand_testnet():
     assert req.network == EXPECTED_CAIP2 == ALGORAND_TESTNET_CAIP2
     assert req.extra["genesisHash"] == TESTNET_GENESIS_HASH
     assert req.extra["genesisId"] == "testnet-v1.0"
+    assert req.extra["tag"] == "x402-global-challenge"
 
 
 def test_requirements_indicate_usdc_10458941():
@@ -198,11 +199,12 @@ def test_mainnet_requirements_use_official_network_and_usdc():
     assert req.network == ALGORAND_MAINNET_CAIP2
     assert req.asset == USDC_MAINNET
     assert req.extra["genesisId"] == "mainnet-v1.0"
+    assert req.extra["tag"] == "x402-global-challenge"
     assert fac.verify_calls == fac.settle_calls == 0
 
 
 def test_invalid_input_without_payment_still_402():
-    # A middleware x402 roda antes da validação do body.
+    # A middleware x402 roda antes da validaÃ§Ã£o do body.
     client, _ = make_x402_client()
     assert client.post(URL, json={"chain": "solana", "mint": "bad"}).status_code == 402
 
@@ -251,7 +253,7 @@ def test_failed_settlement_does_not_release_resource():
 
 
 def test_endpoint_error_is_not_settled():
-    # Pagamento válido + input inválido -> 422 e nenhuma cobrança.
+    # Pagamento vÃ¡lido + input invÃ¡lido -> 422 e nenhuma cobranÃ§a.
     client, fac = make_x402_client()
     req = get_requirements(client).accepts[0]
     r = client.post(URL, json={"chain": "solana", "mint": "bad"},
@@ -311,7 +313,7 @@ def test_simulated_test_mode_still_works(paid_client):
     assert ok.status_code == 200
 
 
-# ---------------------------------------------------------------- configuração
+# ---------------------------------------------------------------- configuraÃ§Ã£o
 
 
 @pytest.mark.parametrize(
@@ -319,7 +321,7 @@ def test_simulated_test_mode_still_works(paid_client):
     [
         {"pay_to": ""},
         {"pay_to": "not-an-address"},
-        {"pay_to": RECEIVER[:-1] + ("A" if RECEIVER[-1] != "A" else "B")},  # checksum inválido
+        {"pay_to": RECEIVER[:-1] + ("A" if RECEIVER[-1] != "A" else "B")},  # checksum invÃ¡lido
         {"x402_network": "algorand-mainnet"},
         {"x402_network": "mainnet"},
         {"x402_network": "algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8="},  # genesis mainnet
