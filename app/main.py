@@ -130,6 +130,44 @@ def create_app(
         logger.exception("unhandled error rid=%s", _rid(request))
         return _error(500, "internal_error", "internal server error", _rid(request))
 
+    @app.get("/", include_in_schema=False)
+    def service_index():
+        """Human/machine entrypoint; intentionally does not make paid requests."""
+        return {
+            "name": "Alpha Hunter X",
+            "description": "Behavioral on-chain intelligence API for Solana agents",
+            "website": "https://alpha-hunter-x-intelligence.vercel.app/",
+            "openapi": "/openapi.json",
+            "x402_discovery": "/.well-known/x402",
+            "investigate": "/v1/token/investigate",
+        }
+
+    @app.get("/.well-known/x402")
+    def x402_discovery():
+        """AHX-specific public manifest, not a standardized Bazaar listing."""
+        return {
+            "format": "ahx-discovery-v1",
+            "name": "Alpha Hunter X",
+            "description": "Solana token creator and wallet behavioral intelligence with evidence and data-quality indicators",
+            "website": "https://alpha-hunter-x-intelligence.vercel.app/",
+            "api_documentation": "/openapi.json",
+            "resource": {
+                "method": "POST",
+                "path": "/v1/token/investigate",
+                "content_type": "application/json",
+                "example_request": {
+                    "chain": "solana",
+                    "mint": "So11111111111111111111111111111111111111112",
+                },
+            },
+            "payment": {
+                "protocol": "x402",
+                "mode": settings.payment_mode,
+                "negotiation": "Make an unsigned POST to receive the PAYMENT-REQUIRED offer when x402 is enabled.",
+            },
+            "data_quality": "Check status and data_quality in every paid response.",
+        }
+
     @app.get("/health")
     def health():
         return {"status": "ok"}
