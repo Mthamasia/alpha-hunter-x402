@@ -19,6 +19,13 @@ APP_ENVS = ("development", "test", "production")
 DEFAULT_FACILITATOR_URL = "https://facilitator.goplausible.xyz"
 DEFAULT_AHX_BRIDGE_URL = "http://127.0.0.1:8787"
 DEFAULT_AHX_BRIDGE_TIMEOUT_SECONDS = 3.0
+DEFAULT_PREVIEW_CACHE_TTL_SECONDS = 60.0
+DEFAULT_PREVIEW_RATE_LIMIT_PER_MINUTE = 30
+DEFAULT_HELIUS_CREDIT_COST_USD = None  # None = not configured; never silently priced as 0
+# ":memory:" = telemetry is not persisted unless the operator explicitly
+# sets TELEMETRY_DB_PATH. Safer default for this stage: no new on-disk
+# footprint until someone opts in.
+DEFAULT_TELEMETRY_DB_PATH = ":memory:"
 # Aliases aceitos somente nos perfis x402 correspondentes.
 ALGORAND_TESTNET_ALIASES = ("testnet", "algorand-testnet")
 ALGORAND_MAINNET_ALIASES = ("mainnet", "algorand-mainnet")
@@ -44,6 +51,48 @@ class Settings:
     public_base_url: str = ""
     cors_allow_origins: tuple[str, ...] = ()
     enable_mainnet_x402: bool = False
+    preview_cache_ttl_seconds: float = DEFAULT_PREVIEW_CACHE_TTL_SECONDS
+    preview_rate_limit_per_minute: int = DEFAULT_PREVIEW_RATE_LIMIT_PER_MINUTE
+    # Cost/telemetry (app/telemetry.py). None = not configured = no cap
+    # enforced yet; this stage only prepares the instrumentation.
+    helius_daily_budget_credits: int | None = None
+    helius_per_query_credit_limit: int | None = None
+    # None = no verified $/credit rate configured. A positive confirmed/
+    # estimated credit count with this still None must price as unknown,
+    # never as 0 -- see app/telemetry.py:build_record.
+    helius_credit_cost_usd: Decimal | None = DEFAULT_HELIUS_CREDIT_COST_USD
+    telemetry_db_path: str = DEFAULT_TELEMETRY_DB_PATH
+    # Persistent preview quota + API keys (app/quota.py). ":memory:" by
+    # default for the same reason as telemetry: no new on-disk footprint
+    # until an operator opts in. In production this MUST be a real,
+    # persistent path (a Railway volume or equivalent) -- see README.
+    quota_db_path: str = DEFAULT_TELEMETRY_DB_PATH
+    # None = trust nothing but the raw transport-level peer address.
+    # Setting this to e.g. "X-Forwarded-For" is only safe once Railway's
+    # actual edge/proxy behavior for this exact header is confirmed.
+    trusted_proxy_header: str | None = None
+    # Only honor trusted_proxy_header when the immediate TCP peer's address
+    # falls inside one of these CIDR blocks -- a configured header NAME
+    # alone does not stop a client from sending it itself. Empty by
+    # default: TRUSTED_PROXY_HEADER has no effect until this is also set.
+    trusted_proxy_cidrs: tuple[str, ...] = ()
+    # HMAC secret for pseudonymizing client IPs before they become a quota
+    # subject_id. Strongly recommended in production; falls back to
+    # unsalted SHA-256 (still not the raw IP at rest, but guessable) if
+    # unset -- see app/quota.py:hash_identifier.
+    quota_ip_pseudonymization_salt: str | None = None
+    # Retention: how long telemetry rows are kept before periodic purge.
+    # Quota buckets have no separate setting -- they are purged down to
+    # "only the current minute/day bucket" (see QuotaStore.purge_expired),
+    # since a past bucket has zero future enforcement value.
+    telemetry_retention_days: int = 90
+    retention_purge_interval_seconds: int = 3600
+    quota_anonymous_per_minute: int = 10
+    quota_anonymous_per_day: int = 50
+    quota_anonymous_distinct_mints_per_day: int = 15
+    quota_registered_per_minute: int = 30
+    quota_registered_per_day: int = 300
+    quota_registered_distinct_mints_per_day: int = 60
 
     def __post_init__(self) -> None:
         if self.app_env not in APP_ENVS:
@@ -61,6 +110,34 @@ class Settings:
             )
         if not math.isfinite(self.ahx_bridge_timeout_seconds) or self.ahx_bridge_timeout_seconds <= 0:
             raise ConfigError("AHX_BRIDGE_TIMEOUT_SECONDS deve ser maior que zero.")
+        if not math.isfinite(self.preview_cache_ttl_seconds) or self.preview_cache_ttl_seconds < 0:
+            raise ConfigError("PREVIEW_CACHE_TTL_SECONDS deve ser >= 0.")
+        if self.preview_rate_limit_per_minute <= 0:
+            raise ConfigError("PREVIEW_RATE_LIMIT_PER_MINUTE deve ser maior que zero.")
+        if self.helius_daily_budget_credits is not None and self.helius_daily_budget_credits < 0:
+            raise ConfigError("HELIUS_DAILY_BUDGET_CREDITS não pode ser negativo.")
+        if self.helius_per_query_credit_limit is not None and self.helius_per_query_credit_limit < 0:
+            raise ConfigError("HELIUS_PER_QUERY_CREDIT_LIMIT não pode ser negativo.")
+        if self.helius_credit_cost_usd is not None and self.helius_credit_cost_usd < 0:
+            raise ConfigError("HELIUS_CREDIT_COST_USD não pode ser negativo.")
+        for name in (
+            "quota_anonymous_per_minute", "quota_anonymous_per_day", "quota_anonymous_distinct_mints_per_day",
+            "quota_registered_per_minute", "quota_registered_per_day", "quota_registered_distinct_mints_per_day",
+            "telemetry_retention_days", "retention_purge_interval_seconds",
+        ):
+            if getattr(self, name) <= 0:
+                raise ConfigError(f"{name.upper()} deve ser maior que zero.")
+        if self.trusted_proxy_header and not self.trusted_proxy_cidrs:
+            raise ConfigError(
+                "TRUSTED_PROXY_HEADER exige TRUSTED_PROXY_CIDRS: um nome de header configurado, "
+                "sem restringir de qual peer ele é aceito, não impede spoofing."
+            )
+        import ipaddress as _ipaddress
+        for cidr in self.trusted_proxy_cidrs:
+            try:
+                _ipaddress.ip_network(cidr, strict=False)
+            except ValueError as exc:
+                raise ConfigError(f"TRUSTED_PROXY_CIDRS contém um bloco inválido: {cidr!r}.") from exc
         if self.intelligence_provider == "alpha_hunter":
             self._validate_ahx_bridge()
         self._validate_public_base_url()
@@ -209,6 +286,36 @@ def load_settings(env_file: str | None = ".env") -> Settings:
     raw_mainnet = os.getenv("ENABLE_MAINNET_X402", "false").strip().lower()
     if raw_mainnet not in ("true", "false"):
         raise ConfigError("ENABLE_MAINNET_X402 deve ser true ou false.")
+
+    def _int_or_none(name: str) -> int | None:
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            return None
+        try:
+            return int(raw)
+        except ValueError as exc:
+            raise ConfigError(f"{name} deve ser um inteiro.") from exc
+
+    try:
+        preview_ttl = float(
+            os.getenv("PREVIEW_CACHE_TTL_SECONDS", str(DEFAULT_PREVIEW_CACHE_TTL_SECONDS)).strip()
+        )
+    except ValueError as exc:
+        raise ConfigError("PREVIEW_CACHE_TTL_SECONDS deve ser numérico.") from exc
+    try:
+        preview_rate = int(
+            os.getenv(
+                "PREVIEW_RATE_LIMIT_PER_MINUTE", str(DEFAULT_PREVIEW_RATE_LIMIT_PER_MINUTE)
+            ).strip()
+        )
+    except ValueError as exc:
+        raise ConfigError("PREVIEW_RATE_LIMIT_PER_MINUTE deve ser um inteiro.") from exc
+    raw_credit_cost = os.getenv("HELIUS_CREDIT_COST_USD", "").strip()
+    try:
+        credit_cost = Decimal(raw_credit_cost) if raw_credit_cost else DEFAULT_HELIUS_CREDIT_COST_USD
+    except InvalidOperation as exc:
+        raise ConfigError("HELIUS_CREDIT_COST_USD deve ser numérico.") from exc
+
     return Settings(
         app_env=os.getenv("APP_ENV", "development").strip().lower(),
         payment_mode=os.getenv("PAYMENT_MODE", "disabled").strip().lower(),
@@ -227,4 +334,29 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         public_base_url=os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/"),
         cors_allow_origins=cors_origins,
         enable_mainnet_x402=raw_mainnet == "true",
+        preview_cache_ttl_seconds=preview_ttl,
+        preview_rate_limit_per_minute=preview_rate,
+        helius_daily_budget_credits=_int_or_none("HELIUS_DAILY_BUDGET_CREDITS"),
+        helius_per_query_credit_limit=_int_or_none("HELIUS_PER_QUERY_CREDIT_LIMIT"),
+        helius_credit_cost_usd=credit_cost,
+        telemetry_db_path=(
+            os.getenv("TELEMETRY_DB_PATH", DEFAULT_TELEMETRY_DB_PATH).strip()
+            or DEFAULT_TELEMETRY_DB_PATH
+        ),
+        quota_db_path=(
+            os.getenv("QUOTA_DB_PATH", DEFAULT_TELEMETRY_DB_PATH).strip() or DEFAULT_TELEMETRY_DB_PATH
+        ),
+        trusted_proxy_header=(os.getenv("TRUSTED_PROXY_HEADER", "").strip() or None),
+        trusted_proxy_cidrs=tuple(
+            c.strip() for c in os.getenv("TRUSTED_PROXY_CIDRS", "").split(",") if c.strip()
+        ),
+        quota_ip_pseudonymization_salt=(os.getenv("QUOTA_IP_PSEUDONYMIZATION_SALT", "").strip() or None),
+        telemetry_retention_days=_int_or_none("TELEMETRY_RETENTION_DAYS") or 90,
+        retention_purge_interval_seconds=_int_or_none("RETENTION_PURGE_INTERVAL_SECONDS") or 3600,
+        quota_anonymous_per_minute=_int_or_none("QUOTA_ANONYMOUS_PER_MINUTE") or 10,
+        quota_anonymous_per_day=_int_or_none("QUOTA_ANONYMOUS_PER_DAY") or 50,
+        quota_anonymous_distinct_mints_per_day=_int_or_none("QUOTA_ANONYMOUS_DISTINCT_MINTS_PER_DAY") or 15,
+        quota_registered_per_minute=_int_or_none("QUOTA_REGISTERED_PER_MINUTE") or 30,
+        quota_registered_per_day=_int_or_none("QUOTA_REGISTERED_PER_DAY") or 300,
+        quota_registered_distinct_mints_per_day=_int_or_none("QUOTA_REGISTERED_DISTINCT_MINTS_PER_DAY") or 60,
     )
