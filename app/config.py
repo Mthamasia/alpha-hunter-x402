@@ -19,6 +19,13 @@ APP_ENVS = ("development", "test", "production")
 DEFAULT_FACILITATOR_URL = "https://facilitator.goplausible.xyz"
 DEFAULT_AHX_BRIDGE_URL = "http://127.0.0.1:8787"
 DEFAULT_AHX_BRIDGE_TIMEOUT_SECONDS = 3.0
+DEFAULT_PREVIEW_CACHE_TTL_SECONDS = 60.0
+DEFAULT_PREVIEW_RATE_LIMIT_PER_MINUTE = 30
+DEFAULT_HELIUS_CREDIT_COST_USD = "0"
+# ":memory:" = telemetry is not persisted unless the operator explicitly
+# sets TELEMETRY_DB_PATH. Safer default for this stage: no new on-disk
+# footprint until someone opts in.
+DEFAULT_TELEMETRY_DB_PATH = ":memory:"
 # Aliases aceitos somente nos perfis x402 correspondentes.
 ALGORAND_TESTNET_ALIASES = ("testnet", "algorand-testnet")
 ALGORAND_MAINNET_ALIASES = ("mainnet", "algorand-mainnet")
@@ -44,6 +51,14 @@ class Settings:
     public_base_url: str = ""
     cors_allow_origins: tuple[str, ...] = ()
     enable_mainnet_x402: bool = False
+    preview_cache_ttl_seconds: float = DEFAULT_PREVIEW_CACHE_TTL_SECONDS
+    preview_rate_limit_per_minute: int = DEFAULT_PREVIEW_RATE_LIMIT_PER_MINUTE
+    # Cost/telemetry (app/telemetry.py). None = not configured = no cap
+    # enforced yet; this stage only prepares the instrumentation.
+    helius_daily_budget_credits: int | None = None
+    helius_per_query_credit_limit: int | None = None
+    helius_credit_cost_usd: Decimal = Decimal(DEFAULT_HELIUS_CREDIT_COST_USD)
+    telemetry_db_path: str = DEFAULT_TELEMETRY_DB_PATH
 
     def __post_init__(self) -> None:
         if self.app_env not in APP_ENVS:
@@ -61,6 +76,16 @@ class Settings:
             )
         if not math.isfinite(self.ahx_bridge_timeout_seconds) or self.ahx_bridge_timeout_seconds <= 0:
             raise ConfigError("AHX_BRIDGE_TIMEOUT_SECONDS deve ser maior que zero.")
+        if not math.isfinite(self.preview_cache_ttl_seconds) or self.preview_cache_ttl_seconds < 0:
+            raise ConfigError("PREVIEW_CACHE_TTL_SECONDS deve ser >= 0.")
+        if self.preview_rate_limit_per_minute <= 0:
+            raise ConfigError("PREVIEW_RATE_LIMIT_PER_MINUTE deve ser maior que zero.")
+        if self.helius_daily_budget_credits is not None and self.helius_daily_budget_credits < 0:
+            raise ConfigError("HELIUS_DAILY_BUDGET_CREDITS não pode ser negativo.")
+        if self.helius_per_query_credit_limit is not None and self.helius_per_query_credit_limit < 0:
+            raise ConfigError("HELIUS_PER_QUERY_CREDIT_LIMIT não pode ser negativo.")
+        if self.helius_credit_cost_usd < 0:
+            raise ConfigError("HELIUS_CREDIT_COST_USD não pode ser negativo.")
         if self.intelligence_provider == "alpha_hunter":
             self._validate_ahx_bridge()
         self._validate_public_base_url()
@@ -209,6 +234,35 @@ def load_settings(env_file: str | None = ".env") -> Settings:
     raw_mainnet = os.getenv("ENABLE_MAINNET_X402", "false").strip().lower()
     if raw_mainnet not in ("true", "false"):
         raise ConfigError("ENABLE_MAINNET_X402 deve ser true ou false.")
+
+    def _int_or_none(name: str) -> int | None:
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            return None
+        try:
+            return int(raw)
+        except ValueError as exc:
+            raise ConfigError(f"{name} deve ser um inteiro.") from exc
+
+    try:
+        preview_ttl = float(
+            os.getenv("PREVIEW_CACHE_TTL_SECONDS", str(DEFAULT_PREVIEW_CACHE_TTL_SECONDS)).strip()
+        )
+    except ValueError as exc:
+        raise ConfigError("PREVIEW_CACHE_TTL_SECONDS deve ser numérico.") from exc
+    try:
+        preview_rate = int(
+            os.getenv(
+                "PREVIEW_RATE_LIMIT_PER_MINUTE", str(DEFAULT_PREVIEW_RATE_LIMIT_PER_MINUTE)
+            ).strip()
+        )
+    except ValueError as exc:
+        raise ConfigError("PREVIEW_RATE_LIMIT_PER_MINUTE deve ser um inteiro.") from exc
+    try:
+        credit_cost = Decimal(os.getenv("HELIUS_CREDIT_COST_USD", DEFAULT_HELIUS_CREDIT_COST_USD).strip())
+    except InvalidOperation as exc:
+        raise ConfigError("HELIUS_CREDIT_COST_USD deve ser numérico.") from exc
+
     return Settings(
         app_env=os.getenv("APP_ENV", "development").strip().lower(),
         payment_mode=os.getenv("PAYMENT_MODE", "disabled").strip().lower(),
@@ -227,4 +281,13 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         public_base_url=os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/"),
         cors_allow_origins=cors_origins,
         enable_mainnet_x402=raw_mainnet == "true",
+        preview_cache_ttl_seconds=preview_ttl,
+        preview_rate_limit_per_minute=preview_rate,
+        helius_daily_budget_credits=_int_or_none("HELIUS_DAILY_BUDGET_CREDITS"),
+        helius_per_query_credit_limit=_int_or_none("HELIUS_PER_QUERY_CREDIT_LIMIT"),
+        helius_credit_cost_usd=credit_cost,
+        telemetry_db_path=(
+            os.getenv("TELEMETRY_DB_PATH", DEFAULT_TELEMETRY_DB_PATH).strip()
+            or DEFAULT_TELEMETRY_DB_PATH
+        ),
     )

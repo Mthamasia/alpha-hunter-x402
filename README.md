@@ -58,6 +58,73 @@ The response is versioned (`schema_version: "1.0"`) and includes:
 upgraded or inferred by the satellite. A bridge 404 returns `NO_DATA` with empty
 intelligence; the API never fabricates evidence.
 
+## Free preview endpoint
+
+`POST /v1/token/preview` is free and requires no payment. It calls the exact
+same `AlphaHunterProvider` path as the paid endpoint -- so a successful
+response is a real proof that this API reaches the read-only bridge and the
+Alpha Hunter database, not a canned reply -- but returns only availability,
+freshness, and data-quality:
+
+```json
+{
+  "schema_version": "1.0",
+  "mint": "So11111111111111111111111111111111111111112",
+  "available": true,
+  "status": "STALE",
+  "age_seconds": 2745044,
+  "is_stale": true,
+  "data_quality": {"status": "STALE", "limitations": ["..."]}
+}
+```
+
+It never returns `intelligence` (creator, wallet activity, behavioral
+findings, evidence, concentration) -- that remains exclusive to the paid
+`/v1/token/investigate`. Two protections exist specifically for this free,
+unauthenticated endpoint (the general rate-limiting policy above still
+applies, and is still better enforced at the edge for multi-instance
+deployments):
+
+- An in-memory, per-mint TTL cache (`PREVIEW_CACHE_TTL_SECONDS`, default 60s)
+  so repeated agent queries for the same token in a short window cost one
+  bridge round trip, not N.
+- An in-memory, per-client-IP fixed-window rate limit
+  (`PREVIEW_RATE_LIMIT_PER_MINUTE`, default 30/min) returning `429`.
+
+Both are per-process state (see Dockerfile: a single uvicorn worker). They do
+not survive a restart and are not shared across replicas; that is an accepted
+limitation for this stage, not a hidden one.
+
+## Cost and revenue telemetry
+
+`app/telemetry.py` records, for every `preview` and `investigate` request, a
+row in a dedicated SQLite store (`TELEMETRY_DB_PATH`, default `:memory:` =
+not persisted until an operator opts in) -- always separate from the Alpha
+Hunter intelligence database, which this service never opens directly.
+
+Each row carries: `request_id`, route, mint, optional `X-Agent-Id`,
+`served_from` (`cache` / `bridge` / `stub`), Helius call/retry counts,
+credits confirmed vs. estimated vs. unknown, revenue (`real` / `simulated` /
+`none`), and an estimated cost/margin. **Nothing here makes a Helius RPC
+call.** Both current data paths (the preview cache and the read-only bridge)
+are SQLite-backed, so every request today is correctly recorded as zero
+Helius calls and zero cost -- the instrumentation is forward-looking, built
+and tested so a future selective on-demand update feature can wrap its real
+RPC calls in the same `HeliusCallTracker`/`BudgetGuard` with no new plumbing.
+A call whose credits are neither confirmed nor estimated is recorded as
+*unknown* and is never priced at zero -- cost (and therefore margin) becomes
+unknown too, rather than invented.
+
+`BudgetGuard` prepares a daily global credit budget, a per-query credit cap,
+and a concurrency cap (`HELIUS_DAILY_BUDGET_CREDITS`,
+`HELIUS_PER_QUERY_CREDIT_LIMIT`); all unset by default (no cap enforced yet).
+`CostLedger.totals_by_mint/agent/period` answer "how much did this token /
+agent / period cost and earn" directly from the stored rows. Reconciling
+these estimates against the Helius dashboard is a manual step for now, and
+must account for the same Helius account/key potentially serving other
+processes (the VPS collector, other AHX tooling) -- this ledger only knows
+about requests that passed through this API.
+
 ## Bazaar discovery and Global x402 Challenge
 
 The x402 `PAYMENT-REQUIRED` response declares the Bazaar extension using the
@@ -100,6 +167,12 @@ keys, mnemonics, or bridge tokens in versioned files.
 | `PUBLIC_BASE_URL` | Required HTTPS public API origin in production. |
 | `CORS_ALLOW_ORIGINS` | Required comma-separated HTTPS browser origins in production. |
 | `ENABLE_MAINNET_X402` | Must be exactly `true` before `x402-mainnet` is accepted. |
+| `PREVIEW_CACHE_TTL_SECONDS` | Free preview per-mint cache TTL, seconds. Default `60`. |
+| `PREVIEW_RATE_LIMIT_PER_MINUTE` | Free preview per-IP rate limit. Default `30`. |
+| `HELIUS_DAILY_BUDGET_CREDITS` | Optional daily credit cap for `BudgetGuard`. Unset = no cap. |
+| `HELIUS_PER_QUERY_CREDIT_LIMIT` | Optional per-query credit cap for `BudgetGuard`. Unset = no cap. |
+| `HELIUS_CREDIT_COST_USD` | USD cost per Helius credit, for cost estimation. Default `0`. |
+| `TELEMETRY_DB_PATH` | Cost/revenue ledger SQLite path. Default `:memory:` (not persisted). |
 
 `APP_ENV=production` fails closed unless `PUBLIC_BASE_URL` and
 `CORS_ALLOW_ORIGINS` are configured. It rejects a localhost bridge and requires

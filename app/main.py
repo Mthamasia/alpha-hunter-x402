@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -13,7 +14,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app import SCHEMA_VERSION, __version__
 from app.config import Settings, load_settings
-from app.models import InvestigateRequest, InvestigateResponse
+from app.models import InvestigateRequest, InvestigateResponse, PreviewResponse
 from app.payments.gate import (
     PAYMENT_HEADER,
     PAYMENT_RESPONSE_HEADER,
@@ -25,8 +26,25 @@ from app.providers import (
     ProviderError,
     create_intelligence_provider,
 )
+from app.ratelimit import FixedWindowRateLimiter, TTLCache
+from app.telemetry import (
+    REVENUE_NONE,
+    REVENUE_REAL,
+    REVENUE_SIMULATED,
+    ROUTE_INVESTIGATE,
+    ROUTE_PREVIEW,
+    SERVED_FROM_BRIDGE,
+    SERVED_FROM_CACHE,
+    SERVED_FROM_STUB,
+    CostLedger,
+    HeliusCallTracker,
+    new_request_id,
+    record_query,
+)
 
 MAX_BODY_BYTES = 4096
+AGENT_ID_HEADER = "X-Agent-Id"
+MAX_AGENT_ID_LEN = 128
 
 logger = logging.getLogger("ahx")
 
@@ -38,6 +56,16 @@ def _error(status: int, code: str, message: str, request_id: str | None, **extra
 
 def _rid(request: Request) -> str | None:
     return getattr(request.state, "request_id", None)
+
+
+def _agent_id(request: Request) -> str | None:
+    raw = request.headers.get(AGENT_ID_HEADER)
+    if not raw:
+        return None
+    raw = raw.strip()
+    if not raw or len(raw) > MAX_AGENT_ID_LEN:
+        return None
+    return raw
 
 
 def _billable_intelligence(result: Any) -> bool:
@@ -69,11 +97,19 @@ def create_app(
     settings = settings or load_settings()
     provider = provider or create_intelligence_provider(settings)
     gate = PaymentGate(settings)
+    preview_cache = TTLCache(ttl_seconds=settings.preview_cache_ttl_seconds)
+    preview_limiter = FixedWindowRateLimiter(
+        max_requests=settings.preview_rate_limit_per_minute, window_seconds=60.0
+    )
+    cost_ledger = CostLedger(settings.telemetry_db_path)
 
     app = FastAPI(title="AHX x402 API", version=__version__)
     app.state.settings = settings
     app.state.provider = provider
     app.state.gate = gate
+    app.state.preview_cache = preview_cache
+    app.state.preview_limiter = preview_limiter
+    app.state.cost_ledger = cost_ledger
     if settings.cors_allow_origins:
         app.add_middleware(
             CORSMiddleware,
@@ -236,19 +272,60 @@ def create_app(
             "provider": provider.name,
         }
 
+    def _revenue_for_investigate(billed: bool) -> tuple[Decimal | None, str]:
+        if settings.payment_mode == "disabled":
+            return None, REVENUE_NONE
+        if settings.payment_mode == "test":
+            return settings.price_usd, REVENUE_SIMULATED
+        # x402-testnet / x402-mainnet: real payment already verified+settled
+        # by the middleware before this handler runs.
+        if billed:
+            return settings.price_usd, REVENUE_REAL
+        return None, REVENUE_NONE
+
     @app.post("/v1/token/investigate", response_model=InvestigateResponse)
     def investigate(body: InvestigateRequest, request: Request):
         decision = gate.verify(request.headers.get(PAYMENT_HEADER), str(request.url.path))
+        tracker = HeliusCallTracker()
         result = provider.investigate(body.chain, body.mint)
-        if settings.payment_mode == "x402-mainnet" and not _billable_intelligence(result):
+        billed = settings.payment_mode != "x402-mainnet" or _billable_intelligence(result)
+        if settings.payment_mode == "x402-mainnet" and not billed:
             # x402 settles only successful endpoint responses: do not charge
             # for missing, old, or unsubstantiated intelligence.
+            revenue_usd, revenue_kind = None, REVENUE_NONE
+            record_query(
+                cost_ledger,
+                tracker=tracker,
+                request_id=request.state.request_id,
+                route=ROUTE_INVESTIGATE,
+                chain=body.chain,
+                mint=body.mint,
+                agent_id=_agent_id(request),
+                served_from=SERVED_FROM_BRIDGE if provider.name == "alpha_hunter" else SERVED_FROM_STUB,
+                revenue_usd=revenue_usd,
+                revenue_kind=revenue_kind,
+                credit_cost_usd=settings.helius_credit_cost_usd,
+            )
             return _error(
                 503,
                 "intelligence_not_ready",
                 "Current evidence is not available for this token; no payment settled.",
                 _rid(request),
             )
+        revenue_usd, revenue_kind = _revenue_for_investigate(billed)
+        record_query(
+            cost_ledger,
+            tracker=tracker,
+            request_id=request.state.request_id,
+            route=ROUTE_INVESTIGATE,
+            chain=body.chain,
+            mint=body.mint,
+            agent_id=_agent_id(request),
+            served_from=SERVED_FROM_BRIDGE if provider.name == "alpha_hunter" else SERVED_FROM_STUB,
+            revenue_usd=revenue_usd,
+            revenue_kind=revenue_kind,
+            credit_cost_usd=settings.helius_credit_cost_usd,
+        )
         payload = InvestigateResponse(
             request_id=request.state.request_id,
             chain=body.chain,
@@ -262,6 +339,63 @@ def create_app(
         if decision.response_header:
             response.headers[PAYMENT_RESPONSE_HEADER] = decision.response_header
         return response
+
+    @app.post("/v1/token/preview", response_model=PreviewResponse)
+    def preview(body: InvestigateRequest, request: Request):
+        """Free, rate-limited, cached summary. Calls the exact same
+        provider/bridge path as the paid endpoint (so this is a real
+        connectivity check, not a canned response) but returns only
+        availability/freshness/data-quality -- never the premium
+        `intelligence` payload.
+        """
+
+        client_key = request.client.host if request.client else "unknown"
+        if not preview_limiter.allow(client_key):
+            return _error(
+                429,
+                "rate_limited",
+                "too many preview requests; try again shortly",
+                _rid(request),
+            )
+
+        cache_key = (body.chain, body.mint)
+        cached = preview_cache.get(cache_key)
+        tracker = HeliusCallTracker()
+        if cached is not None:
+            result = cached
+            served_from = SERVED_FROM_CACHE
+        else:
+            result = provider.investigate(body.chain, body.mint)
+            preview_cache.set(cache_key, result)
+            served_from = SERVED_FROM_BRIDGE if provider.name == "alpha_hunter" else SERVED_FROM_STUB
+
+        record_query(
+            cost_ledger,
+            tracker=tracker,
+            request_id=request.state.request_id,
+            route=ROUTE_PREVIEW,
+            chain=body.chain,
+            mint=body.mint,
+            agent_id=_agent_id(request),
+            served_from=served_from,
+            revenue_usd=None,
+            revenue_kind=REVENUE_NONE,
+            credit_cost_usd=settings.helius_credit_cost_usd,
+        )
+
+        available = result.status not in ("NO_DATA", "NO_DATA_SOURCE")
+        payload = PreviewResponse(
+            request_id=request.state.request_id,
+            chain=body.chain,
+            mint=body.mint,
+            generated_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            available=available,
+            status=result.status,
+            age_seconds=result.age_seconds,
+            is_stale=result.is_stale,
+            data_quality=result.data_quality,
+        )
+        return JSONResponse(content=payload.model_dump(mode="json"))
 
     return app
 

@@ -155,6 +155,14 @@ class AlphaHunterProvider(IntelligenceProvider):
             else bridge_status
         )
 
+        age_seconds = freshness.get("age_seconds")
+        if not isinstance(age_seconds, int):
+            age_seconds = None
+
+        is_stale = freshness.get("is_stale")
+        if not isinstance(is_stale, bool):
+            is_stale = None
+
         return ProviderResult(
             status=public_status,
             intelligence=Intelligence(
@@ -168,4 +176,6 @@ class AlphaHunterProvider(IntelligenceProvider):
                 status=freshness_status,
                 limitations=limitations,
             ),
+            age_seconds=age_seconds,
+            is_stale=is_stale,
         )
