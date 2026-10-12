@@ -40,6 +40,27 @@ def _rid(request: Request) -> str | None:
     return getattr(request.state, "request_id", None)
 
 
+def _billable_intelligence(result: Any) -> bool:
+    """A Mainnet sale requires observed, current, substantive evidence.
+
+    This is a sale-eligibility check, not a live-data collection trigger.
+    Historical or empty reports remain available in internal modes.
+    """
+    quality = getattr(getattr(result, "data_quality", None), "status", None)
+    if quality != "FRESH":
+        return False
+
+    intelligence = getattr(result, "intelligence", None)
+    if intelligence is None or not getattr(intelligence, "evidence", None):
+        return False
+
+    # One evidence item plus at least one meaningful intelligence finding.
+    for attr in ("creator", "wallet_activity", "concentration", "behavioral_findings"):
+        if getattr(intelligence, attr, None):
+            return True
+    return False
+
+
 def create_app(
     settings: Settings | None = None,
     provider: IntelligenceProvider | None = None,
@@ -219,6 +240,15 @@ def create_app(
     def investigate(body: InvestigateRequest, request: Request):
         decision = gate.verify(request.headers.get(PAYMENT_HEADER), str(request.url.path))
         result = provider.investigate(body.chain, body.mint)
+        if settings.payment_mode == "x402-mainnet" and not _billable_intelligence(result):
+            # x402 settles only successful endpoint responses: do not charge
+            # for missing, old, or unsubstantiated intelligence.
+            return _error(
+                503,
+                "intelligence_not_ready",
+                "Current evidence is not available for this token; no payment settled.",
+                _rid(request),
+            )
         payload = InvestigateResponse(
             request_id=request.state.request_id,
             chain=body.chain,
