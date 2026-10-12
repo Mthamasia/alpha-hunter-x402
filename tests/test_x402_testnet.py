@@ -296,6 +296,89 @@ def test_real_facilitator_client_never_reaches_network():
         fac.get_supported()
 
 
+# ---------------------------------------------------------------- Mainnet delivery quality
+
+class FixedProvider:
+    name = "alpha_hunter"
+
+    def __init__(self, quality: str, evidence: list, creator: dict | None = None):
+        self.quality = quality
+        self.evidence = evidence
+        self.creator = creator
+
+    def investigate(self, chain: str, mint: str):
+        from app.providers.base import ProviderResult
+        from app.models import DataQuality, Intelligence
+
+        return ProviderResult(
+            status=self.quality,
+            intelligence=Intelligence(
+                creator=self.creator,
+                evidence=self.evidence,
+            ),
+            data_quality=DataQuality(status=self.quality),
+        )
+
+
+@pytest.mark.parametrize("quality,evidence,creator", [
+    ("STALE", [{"source": "old"}], {"address": "creator"}),
+    ("UNAVAILABLE", [], None),
+    ("FRESH", [], {"address": "creator"}),
+    ("FRESH", [{"source": "observed"}], None),
+])
+def test_mainnet_refuses_to_settle_incomplete_or_stale_reports(
+    quality, evidence, creator
+):
+    fac = FakeFacilitator(network=ALGORAND_MAINNET_CAIP2)
+    provider = FixedProvider(quality, evidence, creator)
+    client = TestClient(
+        create_app(
+            mainnet_x402_settings(),
+            provider=provider,
+            facilitator_client=fac,
+        ),
+        raise_server_exceptions=False,
+    )
+    req = get_requirements(client).accepts[0]
+    result = client.post(
+        URL,
+        json=REQ,
+        headers={"PAYMENT-SIGNATURE": fake_signature_header(req)},
+    )
+    assert result.status_code == 503
+    assert result.json()["error"]["code"] == "intelligence_not_ready"
+    assert fac.settle_calls == 0
+    assert "PAYMENT-RESPONSE" not in result.headers
+
+
+def test_mainnet_settles_once_for_fresh_substantive_report():
+    fac = FakeFacilitator(network=ALGORAND_MAINNET_CAIP2)
+    provider = FixedProvider(
+        "FRESH",
+        [{"source": "on-chain"}],
+        {"address": "creator"},
+    )
+    client = TestClient(
+        create_app(
+            mainnet_x402_settings(),
+            provider=provider,
+            facilitator_client=fac,
+        ),
+        raise_server_exceptions=False,
+    )
+    req = get_requirements(client).accepts[0]
+    result = client.post(
+        URL,
+        json=REQ,
+        headers={"PAYMENT-SIGNATURE": fake_signature_header(req)},
+    )
+    assert result.status_code == 200
+    assert result.json()["data_quality"]["status"] == "FRESH"
+    assert result.json()["intelligence"]["evidence"]
+    assert fac.verify_calls == 1
+    assert fac.settle_calls == 1
+
+
 # ---------------------------------------------------------------- modos existentes
 
 
