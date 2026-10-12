@@ -148,6 +148,14 @@ def test_public_service_index_and_x402_discovery(client):
     payload = manifest.json()
     assert payload["format"] == "ahx-discovery-v1"
     assert payload["resource"]["method"] == "POST"
+    assert len(payload["resources"]) == 1
+    offer = payload["resources"][0]
+    assert offer["method"] == "POST"
+    assert offer["path"] == URL
+    assert offer["price_usd"] == "0.05"
+    assert "creator" in offer["description"].lower()
+    assert offer["input_schema"]["required"] == ["chain", "mint"]
+    assert offer["input_schema"]["properties"]["chain"]["const"] == "solana"
     assert payload["resource"]["path"] == URL
     assert payload["resource"]["example_request"]["chain"] == "solana"
     assert payload["payment"]["protocol"] == "x402"
