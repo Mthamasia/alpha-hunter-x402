@@ -1,0 +1,41 @@
+name: Register Alpha Hunter X on Agent402
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/agent402-register.yml
+
+permissions:
+  contents: read
+
+jobs:
+  register:
+    name: Register public x402 seller
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Register AHX origin with Agent402
+        shell: bash
+        run: |
+          set -euo pipefail
+          origin='https://alpha-hunter-x402-production.up.railway.app'
+          printf 'Registering public AHX origin: %s\n' "$origin"
+          response_file="$(mktemp)"
+          status="$(curl --silent --show-error --max-time 35 --connect-timeout 10 \
+            --output "$response_file" --write-out '%{http_code}' \
+            --request POST 'https://agent402.tools/api/index/register' \
+            --header 'content-type: application/json' \
+            --data '{"origin":"https://alpha-hunter-x402-production.up.railway.app"}')"
+          printf 'Registration HTTP status: %s\n' "$status"
+          head -c 5000 "$response_file" || true
+          printf '\n'
+          if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then exit 1; fi
+      - name: Check public listing endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --silent --show-error --max-time 15 --connect-timeout 8 \
+            'https://agent402.tools/api/index?seller=alpha-hunter-x402-production.up.railway.app' \
+            | head -c 3500 || true
+          printf '\nRegistration can be pending; re-check after crawler completes.\n'
