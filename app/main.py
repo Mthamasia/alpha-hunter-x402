@@ -26,13 +26,22 @@ from app.providers import (
     ProviderError,
     create_intelligence_provider,
 )
-from app.ratelimit import FixedWindowRateLimiter, TTLCache
+from app.quota import (
+    TIER_ANONYMOUS,
+    TIER_FREE_KEY,
+    QuotaStore,
+    TierLimits,
+)
+from app.ratelimit import TTLCache
 from app.telemetry import (
+    REVENUE_FAILED,
     REVENUE_NONE,
-    REVENUE_REAL,
+    REVENUE_PENDING,
+    REVENUE_SETTLED,
     REVENUE_SIMULATED,
     ROUTE_INVESTIGATE,
     ROUTE_PREVIEW,
+    SERVED_FROM_BLOCKED,
     SERVED_FROM_BRIDGE,
     SERVED_FROM_CACHE,
     SERVED_FROM_STUB,
@@ -43,8 +52,13 @@ from app.telemetry import (
 )
 
 MAX_BODY_BYTES = 4096
-AGENT_ID_HEADER = "X-Agent-Id"
+AGENT_ID_HEADER = "X-Agent-Id"  # unauthenticated client claim; never gates quota or identity
+API_KEY_HEADER = "X-API-Key"
 MAX_AGENT_ID_LEN = 128
+# The official x402-avm library's settlement response header -- distinct
+# from app.payments.gate.PAYMENT_RESPONSE_HEADER ("X-PAYMENT-RESPONSE"),
+# which only exists for this project's own simulated `test` mode.
+X402_SETTLEMENT_HEADER = "PAYMENT-RESPONSE"
 
 logger = logging.getLogger("ahx")
 
@@ -59,6 +73,10 @@ def _rid(request: Request) -> str | None:
 
 
 def _agent_id(request: Request) -> str | None:
+    """An UNAUTHENTICATED client claim (`X-Agent-Id`). Recorded in
+    telemetry as a label only; never used to resolve identity or gate
+    quota -- see `_resolve_subject_and_tier`."""
+
     raw = request.headers.get(AGENT_ID_HEADER)
     if not raw:
         return None
@@ -66,6 +84,38 @@ def _agent_id(request: Request) -> str | None:
     if not raw or len(raw) > MAX_AGENT_ID_LEN:
         return None
     return raw
+
+
+def _resolve_client_ip(request: Request, settings: Settings) -> str:
+    """Nothing is trusted by default: a client-supplied forwarded-for
+    header is exactly as spoofable as `X-Agent-Id` unless the operator
+    has explicitly confirmed which header their edge/proxy sets and
+    configured its exact name via TRUSTED_PROXY_HEADER."""
+
+    if settings.trusted_proxy_header:
+        value = request.headers.get(settings.trusted_proxy_header)
+        if value:
+            return value.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _resolve_subject_and_tier(
+    request: Request, settings: Settings, quota_store: QuotaStore
+) -> tuple[str, str]:
+    """Returns (subject_id, tier) for quota purposes. An API key always
+    wins over IP if present and valid; an unknown/revoked key falls back
+    to the anonymous IP-based subject rather than erroring, so a bad key
+    degrades to the free tier instead of blocking the request outright."""
+
+    raw_key = request.headers.get(API_KEY_HEADER)
+    if raw_key:
+        tier = quota_store.resolve_key_tier(raw_key)
+        if tier is not None:
+            from app.quota import hash_key
+
+            return f"key:{hash_key(raw_key)}", tier
+    ip = _resolve_client_ip(request, settings)
+    return f"ip:{ip}", TIER_ANONYMOUS
 
 
 def _billable_intelligence(result: Any) -> bool:
@@ -98,18 +148,30 @@ def create_app(
     provider = provider or create_intelligence_provider(settings)
     gate = PaymentGate(settings)
     preview_cache = TTLCache(ttl_seconds=settings.preview_cache_ttl_seconds)
-    preview_limiter = FixedWindowRateLimiter(
-        max_requests=settings.preview_rate_limit_per_minute, window_seconds=60.0
-    )
     cost_ledger = CostLedger(settings.telemetry_db_path)
+    quota_store = QuotaStore(
+        settings.quota_db_path,
+        tier_limits={
+            TIER_ANONYMOUS: TierLimits(
+                per_minute=settings.quota_anonymous_per_minute,
+                per_day=settings.quota_anonymous_per_day,
+                distinct_mints_per_day=settings.quota_anonymous_distinct_mints_per_day,
+            ),
+            TIER_FREE_KEY: TierLimits(
+                per_minute=settings.quota_registered_per_minute,
+                per_day=settings.quota_registered_per_day,
+                distinct_mints_per_day=settings.quota_registered_distinct_mints_per_day,
+            ),
+        },
+    )
 
     app = FastAPI(title="AHX x402 API", version=__version__)
     app.state.settings = settings
     app.state.provider = provider
     app.state.gate = gate
     app.state.preview_cache = preview_cache
-    app.state.preview_limiter = preview_limiter
     app.state.cost_ledger = cost_ledger
+    app.state.quota_store = quota_store
     if settings.cors_allow_origins:
         app.add_middleware(
             CORSMiddleware,
@@ -121,6 +183,8 @@ def create_app(
         )
 
     if settings.payment_mode in ("x402-testnet", "x402-mainnet"):
+        from x402.http import decode_payment_response_header
+
         from app.payments.x402_avm import build_x402_middleware
 
         x402_mw = build_x402_middleware(settings, facilitator_client)
@@ -130,12 +194,51 @@ def create_app(
         @app.middleware("http")
         async def x402_payment(request: Request, call_next):
             try:
-                return await x402_mw(request, call_next)
+                response = await x402_mw(request, call_next)
             except Exception:
                 # Fail closed: facilitator indisponível / rota não suportada -> 503.
                 logger.exception("x402 payment layer error rid=%s", _rid(request))
                 return _error(503, "payment_unavailable",
                               "payment facilitator unavailable", _rid(request))
+
+            # Settlement happens INSIDE x402_mw, after the route already ran
+            # (and already wrote a PENDING telemetry row -- see `investigate`
+            # below). Only now do we know the real outcome, so only now do
+            # we finalize revenue to SETTLED/FAILED. If this header is
+            # absent, settlement was never attempted (e.g. no payment, or
+            # verification failed before the route ran) and there is no
+            # pending row to finalize either -- `finalize_revenue` is a
+            # harmless no-op in that case.
+            settlement_header = response.headers.get(X402_SETTLEMENT_HEADER)
+            request_id = _rid(request)
+            if request_id:
+                if settlement_header:
+                    try:
+                        settlement = decode_payment_response_header(settlement_header)
+                    except Exception:
+                        logger.exception("undecodable settlement response rid=%s", request_id)
+                    else:
+                        if settlement.success:
+                            cost_ledger.finalize_revenue(
+                                request_id, revenue_kind=REVENUE_SETTLED, revenue_usd=settings.price_usd
+                            )
+                        else:
+                            cost_ledger.finalize_revenue(
+                                request_id, revenue_kind=REVENUE_FAILED, revenue_usd=None
+                            )
+                elif response.status_code != 200:
+                    # The library swaps a failed-settlement response for a
+                    # 402 with no PAYMENT-RESPONSE header at all (confirmed
+                    # empirically, not documented). `finalize_revenue` only
+                    # touches a row that is still PENDING, so this is a
+                    # harmless no-op for every other non-200 response that
+                    # never recorded a pending row in the first place (no
+                    # payment provided, validation errors, unreachable
+                    # facilitator, mainnet no-charge decisions, ...).
+                    cost_ledger.finalize_revenue(
+                        request_id, revenue_kind=REVENUE_FAILED, revenue_usd=None
+                    )
+            return response
 
     @app.middleware("http")
     async def request_context(request: Request, call_next):
@@ -196,6 +299,7 @@ def create_app(
             "website": "https://alpha-hunter-x-intelligence.vercel.app/",
             "openapi": "/openapi.json",
             "x402_discovery": "/.well-known/x402",
+            "preview": "/v1/token/preview",
             "investigate": "/v1/token/investigate",
         }
 
@@ -220,16 +324,31 @@ def create_app(
             "resources": [
                 {
                     "method": "POST",
-                    "path": "/v1/token/investigate",
-                    "name": "Solana creator and wallet behavioral intelligence",
+                    "path": "/v1/token/preview",
+                    "name": "Free token availability/freshness preview",
                     "description": (
-                        "Investigate token creator behavior, wallet activity, "
-                        "concentration, historical behavioral findings and "
-                        "traceable evidence for AI trading agents. "
-                        "Returns explicit data-quality and freshness status. "
-                        "Does not execute trades."
+                        "Free, no payment required. Returns only availability, "
+                        "data age, FRESH/STALE classification and data-quality "
+                        "limitations for a Solana token -- never creator, wallet "
+                        "activity, behavioral findings or evidence. Rate-limited "
+                        "per caller; see /v1/token/investigate for the full "
+                        "paid investigation."
                     ),
-                    "price_usd": str(settings.price_usd),
+                    "price_usd": "0",
+                    "payment": {"required": False},
+                    "rate_limits": {
+                        "anonymous": {
+                            "per_minute": settings.quota_anonymous_per_minute,
+                            "per_day": settings.quota_anonymous_per_day,
+                            "distinct_mints_per_day": settings.quota_anonymous_distinct_mints_per_day,
+                        },
+                        "api_key": {
+                            "per_minute": settings.quota_registered_per_minute,
+                            "per_day": settings.quota_registered_per_day,
+                            "distinct_mints_per_day": settings.quota_registered_distinct_mints_per_day,
+                            "header": API_KEY_HEADER,
+                        },
+                    },
                     "input_schema": {
                         "type": "object",
                         "properties": {
@@ -243,7 +362,34 @@ def create_app(
                         "required": ["chain", "mint"],
                         "additionalProperties": False,
                     },
-                }
+                },
+                {
+                    "method": "POST",
+                    "path": "/v1/token/investigate",
+                    "name": "Solana creator and wallet behavioral intelligence",
+                    "description": (
+                        "Investigate token creator behavior, wallet activity, "
+                        "concentration, historical behavioral findings and "
+                        "traceable evidence for AI trading agents. "
+                        "Returns explicit data-quality and freshness status. "
+                        "Does not execute trades."
+                    ),
+                    "price_usd": str(settings.price_usd),
+                    "payment": {"required": True, "protocol": "x402"},
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "chain": {"type": "string", "const": "solana"},
+                            "mint": {
+                                "type": "string",
+                                "minLength": 32,
+                                "maxLength": 44,
+                            },
+                        },
+                        "required": ["chain", "mint"],
+                        "additionalProperties": False,
+                    },
+                },
             ],
             "payment": {
                 "protocol": "x402",
@@ -276,11 +422,19 @@ def create_app(
         if settings.payment_mode == "disabled":
             return None, REVENUE_NONE
         if settings.payment_mode == "test":
+            # Simulated mode has no real async facilitator step -- the
+            # "settlement" already happened synchronously in `gate.verify`.
             return settings.price_usd, REVENUE_SIMULATED
-        # x402-testnet / x402-mainnet: real payment already verified+settled
-        # by the middleware before this handler runs.
+        # x402-testnet / x402-mainnet: verification already happened (in the
+        # x402 middleware, before this handler ran), but REAL settlement
+        # happens in that same middleware AFTER this handler returns -- so
+        # revenue can only be PENDING here. The middleware finalizes this
+        # exact row to SETTLED/FAILED once the facilitator actually confirms
+        # (see `x402_payment` above). Recording SETTLED here, before that
+        # confirmation exists, is exactly the bug this stage fixes: a
+        # failed settlement must never look like revenue.
         if billed:
-            return settings.price_usd, REVENUE_REAL
+            return None, REVENUE_PENDING
         return None, REVENUE_NONE
 
     @app.post("/v1/token/investigate", response_model=InvestigateResponse)
@@ -342,21 +496,47 @@ def create_app(
 
     @app.post("/v1/token/preview", response_model=PreviewResponse)
     def preview(body: InvestigateRequest, request: Request):
-        """Free, rate-limited, cached summary. Calls the exact same
+        """Free, quota-limited, cached summary. Calls the exact same
         provider/bridge path as the paid endpoint (so this is a real
         connectivity check, not a canned response) but returns only
         availability/freshness/data-quality -- never the premium
         `intelligence` payload.
+
+        Quota is checked BEFORE touching the cache or the bridge, and is
+        persistent/atomic (app/quota.py) -- not the simple in-process
+        limiter this endpoint shipped with initially. Database/cache-only
+        is an absolute invariant: nothing below this point ever has a
+        code path to Helius, successful or not (see tests/test_preview.py
+        ::test_preview_never_calls_helius_on_any_path for the explicit,
+        always-on proof).
         """
 
-        client_key = request.client.host if request.client else "unknown"
-        if not preview_limiter.allow(client_key):
-            return _error(
+        subject_id, tier = _resolve_subject_and_tier(request, settings, quota_store)
+        decision = quota_store.check_and_consume(subject_id, tier, body.mint)
+        if not decision.allowed:
+            record_query(
+                cost_ledger,
+                tracker=HeliusCallTracker(),
+                request_id=request.state.request_id,
+                route=ROUTE_PREVIEW,
+                chain=body.chain,
+                mint=body.mint,
+                agent_id=_agent_id(request),
+                served_from=SERVED_FROM_BLOCKED,
+                revenue_usd=None,
+                revenue_kind=REVENUE_NONE,
+                credit_cost_usd=settings.helius_credit_cost_usd,
+            )
+            retry_after = decision.retry_after_seconds or 60
+            response = _error(
                 429,
                 "rate_limited",
-                "too many preview requests; try again shortly",
+                "preview quota exceeded; try again later",
                 _rid(request),
+                reason=decision.reason,
             )
+            response.headers["Retry-After"] = str(retry_after)
+            return response
 
         cache_key = (body.chain, body.mint)
         cached = preview_cache.get(cache_key)

@@ -262,6 +262,69 @@ def test_endpoint_error_is_not_settled():
     assert fac.settle_calls == 0
 
 
+# ---------------------------------------------------------------- settlement-confirmed revenue
+
+
+def test_successful_settlement_records_real_revenue_only_after_confirmation():
+    from app.telemetry import REVENUE_SETTLED
+
+    client, fac = make_x402_client()
+    req = get_requirements(client).accepts[0]
+    r = client.post(URL, json=REQ, headers={"PAYMENT-SIGNATURE": fake_signature_header(req)})
+
+    assert r.status_code == 200
+    assert fac.settle_calls == 1
+
+    totals = client.app.state.cost_ledger.totals_by_mint(WSOL_MINT)
+    assert totals["query_count"] == 1
+    assert totals["revenue_usd_total"] == "0.05"
+
+    row = client.app.state.cost_ledger.all_records()[0]
+    assert row["revenue_kind"] == REVENUE_SETTLED
+
+
+def test_failed_settlement_records_zero_revenue_not_real():
+    """The exact bug the audit flagged: a failed facilitator settlement
+    must never be recorded as revenue, even though the route handler
+    (which has no way to know the outcome yet) already ran."""
+
+    from app.telemetry import REVENUE_FAILED, REVENUE_SETTLED
+
+    client, fac = make_x402_client(FakeFacilitator(settle_ok=False))
+    req = get_requirements(client).accepts[0]
+    r = client.post(URL, json=REQ, headers={"PAYMENT-SIGNATURE": fake_signature_header(req)})
+
+    assert r.status_code == 402  # resource withheld, matches existing behavior
+    assert fac.settle_calls == 1
+
+    rows = client.app.state.cost_ledger.all_records()
+    assert len(rows) == 1  # the route did run once, recording a pending attempt
+    row = rows[0]
+    assert row["revenue_kind"] != REVENUE_SETTLED
+    assert row["revenue_kind"] == REVENUE_FAILED
+    assert row["revenue_usd"] is None
+
+    totals = client.app.state.cost_ledger.totals_by_mint(WSOL_MINT)
+    assert totals["revenue_usd_total"] == "0"  # no phantom revenue
+
+
+def test_endpoint_error_never_creates_a_pending_row():
+    client, fac = make_x402_client()
+    req = get_requirements(client).accepts[0]
+    client.post(URL, json={"chain": "solana", "mint": "bad"},
+                headers={"PAYMENT-SIGNATURE": fake_signature_header(req)})
+
+    assert fac.settle_calls == 0
+    assert client.app.state.cost_ledger.all_records() == []
+
+
+def test_unreachable_facilitator_never_records_phantom_revenue():
+    client, _ = make_x402_client(FakeFacilitator(supported=False))
+    client.post(URL, json=REQ)
+
+    assert client.app.state.cost_ledger.all_records() == []
+
+
 def test_mismatched_payment_requirements_rejected():
     client, fac = make_x402_client()
     req = get_requirements(client).accepts[0].model_copy(update={"amount": "1"})

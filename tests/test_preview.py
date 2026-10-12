@@ -166,7 +166,7 @@ def test_preview_rate_limited_after_threshold(monkeypatch):
     app, _ = make_app(
         monkeypatch,
         lambda _u, _h: httpx.Response(200, json=bridge_payload()),
-        preview_rate_limit_per_minute=2,
+        quota_anonymous_per_minute=2,
     )
     client = TestClient(app)
 
@@ -177,6 +177,8 @@ def test_preview_rate_limited_after_threshold(monkeypatch):
     assert r1.status_code == 200
     assert r2.status_code == 200
     assert r3.status_code == 429
+    assert r3.headers["Retry-After"]
+    assert r3.json()["error"]["reason"] == "per_minute_limit_exceeded"
     assert r3.json()["error"]["code"] == "rate_limited"
 
 
@@ -206,6 +208,125 @@ def test_preview_telemetry_records_agent_id_from_header(monkeypatch):
 
     totals = app.state.cost_ledger.totals_by_agent("agent-xyz")
     assert totals["query_count"] == 1
+
+
+def test_preview_never_calls_helius_on_any_path(monkeypatch):
+    """Absolute invariant: the free preview endpoint is database/cache
+    only. This test fails if ANY code path under /v1/token/preview ever
+    opens a socket to anything other than the (monkeypatched, loopback-
+    only per conftest.block_network) bridge call -- success, cache hit,
+    unknown mint, invalid mint, bridge 401/404/500, and quota-blocked are
+    all exercised here under one audit hook."""
+
+    import sys
+
+    seen_non_loopback = []
+
+    def audit_hook(event, args):
+        if event in ("socket.connect", "socket.getaddrinfo"):
+            addr = args[0] if event == "socket.getaddrinfo" else args[1]
+            host = addr[0] if isinstance(addr, tuple) else addr
+            if host not in ("127.0.0.1", "::1", "localhost", None):
+                seen_non_loopback.append((event, args))
+
+    sys.addaudithook(audit_hook)  # audit hooks cannot be removed; fine for one test process
+
+    app, _ = make_app(
+        monkeypatch,
+        lambda _u, _h: httpx.Response(200, json=bridge_payload()),
+        quota_anonymous_per_minute=2,
+        quota_anonymous_distinct_mints_per_day=1,
+    )
+    client = TestClient(app)
+
+    client.post(URL, json={"chain": "solana", "mint": WSOL_MINT})  # success, cache miss
+    client.post(URL, json={"chain": "solana", "mint": WSOL_MINT})  # success, cache hit
+    client.post(URL, json={"chain": "solana", "mint": "not-a-real-mint"})  # 422
+    client.post(URL, json={"chain": "solana", "mint": UNKNOWN_MINT})  # distinct-mint quota block (429)
+
+    app_401, _ = make_app(monkeypatch, lambda _u, _h: httpx.Response(401))
+    TestClient(app_401).post(URL, json={"chain": "solana", "mint": WSOL_MINT})
+
+    app_500, _ = make_app(monkeypatch, lambda _u, _h: httpx.Response(500))
+    TestClient(app_500).post(URL, json={"chain": "solana", "mint": WSOL_MINT})
+
+    assert seen_non_loopback == []
+
+
+def test_preview_api_key_gets_registered_tier_limits(monkeypatch):
+    app, _ = make_app(
+        monkeypatch,
+        lambda _u, _h: httpx.Response(200, json=bridge_payload()),
+        quota_anonymous_per_minute=1,
+        quota_registered_per_minute=3,
+    )
+    client = TestClient(app)
+    issued = app.state.quota_store.issue_api_key("agent-alpha")
+
+    # Anonymous: blocked on the 2nd request (limit 1/min).
+    client.post(URL, json={"chain": "solana", "mint": WSOL_MINT})
+    assert client.post(URL, json={"chain": "solana", "mint": WSOL_MINT}).status_code == 429
+
+    # With a valid API key: allowed up to its own, higher limit (3/min),
+    # unaffected by the anonymous IP's exhausted quota.
+    headers = {"X-API-Key": issued.raw_key}
+    assert client.post(URL, json={"chain": "solana", "mint": WSOL_MINT}, headers=headers).status_code == 200
+    assert client.post(URL, json={"chain": "solana", "mint": WSOL_MINT}, headers=headers).status_code == 200
+    assert client.post(URL, json={"chain": "solana", "mint": WSOL_MINT}, headers=headers).status_code == 200
+    assert client.post(URL, json={"chain": "solana", "mint": WSOL_MINT}, headers=headers).status_code == 429
+
+
+def test_preview_revoked_api_key_falls_back_to_anonymous_tier(monkeypatch):
+    app, _ = make_app(
+        monkeypatch,
+        lambda _u, _h: httpx.Response(200, json=bridge_payload()),
+        quota_anonymous_per_minute=1,
+        quota_registered_per_minute=5,
+    )
+    client = TestClient(app)
+    issued = app.state.quota_store.issue_api_key("agent-alpha")
+    app.state.quota_store.revoke_api_key(issued.key_id)
+
+    headers = {"X-API-Key": issued.raw_key}
+    assert client.post(URL, json={"chain": "solana", "mint": WSOL_MINT}, headers=headers).status_code == 200
+    # Falls back to the anonymous limit (1/min), not the revoked key's tier.
+    assert client.post(URL, json={"chain": "solana", "mint": WSOL_MINT}, headers=headers).status_code == 429
+
+
+def test_preview_fails_closed_when_quota_store_is_unavailable(monkeypatch):
+    import sqlite3
+
+    app, _ = make_app(monkeypatch, lambda _u, _h: httpx.Response(200, json=bridge_payload()))
+
+    def broken_connect(self):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    from app.quota import QuotaStore
+
+    monkeypatch.setattr(QuotaStore, "_connect", broken_connect)
+    client = TestClient(app)
+
+    r = client.post(URL, json={"chain": "solana", "mint": WSOL_MINT})
+    assert r.status_code == 429  # fails closed, never unlimited
+    assert r.json()["error"]["reason"] == "quota_store_unavailable"
+
+
+def test_blocked_preview_requests_are_recorded_separately_from_successful_ones(monkeypatch):
+    app, _ = make_app(
+        monkeypatch,
+        lambda _u, _h: httpx.Response(200, json=bridge_payload()),
+        quota_anonymous_per_minute=1,
+    )
+    client = TestClient(app)
+
+    client.post(URL, json={"chain": "solana", "mint": WSOL_MINT})
+    client.post(URL, json={"chain": "solana", "mint": WSOL_MINT})  # blocked
+
+    from app.telemetry import SERVED_FROM_BLOCKED, SERVED_FROM_BRIDGE
+
+    rows = app.state.cost_ledger.all_records()
+    served_from = sorted(r["served_from"] for r in rows)
+    assert served_from == sorted([SERVED_FROM_BRIDGE, SERVED_FROM_BLOCKED])
 
 
 def test_investigate_route_still_works_and_records_revenue(monkeypatch):

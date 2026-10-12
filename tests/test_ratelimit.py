@@ -53,3 +53,26 @@ def test_fixed_window_limiter_resets_after_window():
 
     clock.advance(60)
     assert limiter.allow("k") is True
+
+
+def test_ttl_cache_is_bounded_and_evicts_oldest_under_a_large_scan():
+    clock = FakeClock()
+    cache = TTLCache(ttl_seconds=3600, clock=clock, max_entries=100)
+
+    for i in range(10_000):
+        cache.set(f"mint-{i}", i)
+
+    assert len(cache) == 100
+    # The earliest-inserted keys were evicted; the most recent survive.
+    assert cache.get("mint-0") is None
+    assert cache.get("mint-9999") == 9999
+
+
+def test_fixed_window_limiter_is_bounded_under_a_large_ip_scan():
+    clock = FakeClock()
+    limiter = FixedWindowRateLimiter(max_requests=10, window_seconds=60, clock=clock, max_entries=50)
+
+    for i in range(10_000):
+        limiter.allow(f"203.0.113.{i}")
+
+    assert len(limiter) == 50

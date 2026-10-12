@@ -43,10 +43,13 @@ ROUTE_INVESTIGATE = "investigate"
 SERVED_FROM_CACHE = "cache"
 SERVED_FROM_BRIDGE = "bridge"
 SERVED_FROM_STUB = "stub"
+SERVED_FROM_BLOCKED = "blocked"  # quota/rate-limit rejection; never a successful query
 
 REVENUE_NONE = "none"
 REVENUE_SIMULATED = "simulated"
-REVENUE_REAL = "real"
+REVENUE_PENDING = "pending"  # payment verified, settlement not yet confirmed
+REVENUE_SETTLED = "settled"  # settlement confirmed successful by the facilitator
+REVENUE_FAILED = "failed"  # settlement confirmed failed; no revenue
 
 
 class BudgetExceeded(RuntimeError):
@@ -209,12 +212,19 @@ def build_record(
     usage: HeliusUsageSummary,
     revenue_usd: Decimal | None,
     revenue_kind: str,
-    credit_cost_usd: Decimal,
+    credit_cost_usd: Decimal | None,
     now: datetime | None = None,
 ) -> QueryCostRecord:
-    """Never invents a cost: zero Helius calls -> cost is exactly 0.
-    Any unknown-credit attempt -> cost is None (unknown), even if other
-    attempts in the same query had confirmed/estimated credits.
+    """Never invents a cost.
+
+    - Zero Helius calls -> cost is exactly 0 (always a valid fact,
+      regardless of whether a credit rate is configured).
+    - Any unknown-credit attempt -> cost is None (unknown), even if other
+      attempts in the same query had confirmed/estimated credits.
+    - Known (confirmed/estimated) credits but NO configured credit rate
+      (`credit_cost_usd is None`) -> cost is None (unknown), never 0.
+      A positive credit count priced at "0" because nobody configured a
+      rate would make margin look artificially profitable.
     """
 
     now = now or datetime.now(timezone.utc)
@@ -222,6 +232,8 @@ def build_record(
     if usage.zero_helius_calls:
         cost: Decimal | None = Decimal("0")
     elif usage.credits_unknown:
+        cost = None
+    elif credit_cost_usd is None:
         cost = None
     else:
         known_credits = (usage.credits_confirmed_total or 0) + (usage.credits_estimated_total or 0)
@@ -265,7 +277,7 @@ def record_query(
     served_from: str,
     revenue_usd: Decimal | None,
     revenue_kind: str,
-    credit_cost_usd: Decimal,
+    credit_cost_usd: Decimal | None,
     now: datetime | None = None,
 ) -> QueryCostRecord:
     """Builds a record (with the full raw-calls audit trail) and persists
@@ -377,6 +389,56 @@ class CostLedger:
         with self._lock, self._connect() as conn:
             return conn.execute("SELECT * FROM query_costs ORDER BY timestamp").fetchall()
 
+    def finalize_revenue(
+        self, request_id: str, *, revenue_kind: str, revenue_usd: Decimal | None
+    ) -> bool:
+        """Updates a PENDING row once real x402 settlement is confirmed
+        (success or failure) by the middleware -- never by the route
+        handler itself, which runs before settlement happens.
+
+        Only transitions a row that is still PENDING: a no-op (returns
+        False) if no row exists for this request_id (verification itself
+        failed, so the route never ran), or if the row was already
+        finalized to something else (e.g. REVENUE_NONE for a mainnet
+        no-charge decision) -- that must never be overwritten to FAILED
+        just because the HTTP response happened to be non-200.
+        """
+
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT cost_usd_estimated FROM query_costs WHERE request_id = ? AND revenue_kind = ?",
+                (request_id, REVENUE_PENDING),
+            ).fetchone()
+            if row is None:
+                return False
+            cost = row["cost_usd_estimated"]
+            margin = (
+                str(Decimal(revenue_usd) - Decimal(cost))
+                if revenue_usd is not None and cost is not None
+                else None
+            )
+            conn.execute(
+                "UPDATE query_costs SET revenue_usd = ?, revenue_kind = ?, margin_usd_estimated = ? "
+                "WHERE request_id = ? AND revenue_kind = ?",
+                (
+                    str(revenue_usd) if revenue_usd is not None else None,
+                    revenue_kind,
+                    margin,
+                    request_id,
+                    REVENUE_PENDING,
+                ),
+            )
+            return True
+
+    def purge_older_than(self, cutoff_iso: str) -> int:
+        """Retention: deletes rows older than `cutoff_iso` (ISO-8601,
+        UTC). Returns the number of rows removed. Callers decide the
+        retention window; this module does not invent a default."""
+
+        with self._lock, self._connect() as conn:
+            cur = conn.execute("DELETE FROM query_costs WHERE timestamp < ?", (cutoff_iso,))
+            return cur.rowcount
+
     def totals_by_mint(self, mint: str) -> dict:
         return self._aggregate("mint = ?", (mint,))
 
@@ -440,81 +502,179 @@ class BudgetDecision:
     reason: str | None = None
 
 
+_BUDGET_SCHEMA = """
+CREATE TABLE IF NOT EXISTS budget_state (
+    scope TEXT PRIMARY KEY,
+    day TEXT NOT NULL,
+    reserved_credits INTEGER NOT NULL DEFAULT 0,
+    spent_credits INTEGER NOT NULL DEFAULT 0
+);
+"""
+
+
+class ReservationHandle:
+    """Yielded by `BudgetGuard.reserve()`. Call `.commit(actual_credits)`
+    before the `with` block ends to move the reservation into confirmed
+    spend. If `.commit()` is never called (e.g. an exception was raised
+    before any real work happened), the reservation is released with
+    zero spend -- a full rollback."""
+
+    def __init__(self) -> None:
+        self.actual_credits: int | None = None
+
+    def commit(self, actual_credits: int) -> None:
+        self.actual_credits = actual_credits
+
+
 class BudgetGuard:
     """Daily global credit budget + per-query credit cap + concurrency cap
-    on in-flight Helius calls. `None` means "not configured" (no cap).
+    on in-flight Helius calls.
 
-    Nothing in this stage spends real credits -- there is no real Helius
-    call site yet. This guard exists so a future selective on-demand
-    update feature can call `reserve()` around a real RPC call on day
-    one, instead of bolting budget enforcement on after the fact.
+    `reserve()` is atomic: the check (per-query limit, daily budget
+    including what is already *reserved* by other in-flight calls, and
+    concurrency) and the reservation itself happen under the same lock
+    and the same SQLite transaction, so concurrent callers cannot both
+    pass a check that only one of them should pass (the bug this class
+    previously had: `check_query` ran outside the lock that incremented
+    `_in_flight`, and the daily spend was only updated after the fact by
+    a separate, uncoordinated `record_spend`).
+
+    Credits (`reserved_credits`/`spent_credits`) are persisted in SQLite
+    (same ledger file as `CostLedger`, keyed by `scope`) so a restart or
+    redeploy cannot silently reset the daily budget to zero. In-flight
+    concurrency is intentionally kept in-process: a fresh process has no
+    calls genuinely in flight, so resetting it on restart is correct, not
+    a gap.
+
+    `allow_unknown_credits=False` (the default) means an estimate of
+    `None` is refused outright in anything that claims to be a real
+    budget -- the audited risk is a free/cheap "unknown-cost" call
+    silently bypassing every cap.
     """
 
     def __init__(
         self,
         *,
+        ledger_db_path: str,
         daily_budget_credits: int | None,
         per_query_credit_limit: int | None,
         max_concurrent_calls: int | None = None,
-        clock: Callable[[], float] = time.monotonic,
+        allow_unknown_credits: bool = False,
+        scope: str = "global",
         day_provider: Callable[[], str] | None = None,
     ):
         self._daily_budget = daily_budget_credits
         self._per_query_limit = per_query_credit_limit
         self._max_concurrent = max_concurrent_calls
-        self._clock = clock
+        self._allow_unknown = allow_unknown_credits
+        self._scope = scope
         self._day_provider = day_provider or (lambda: datetime.now(timezone.utc).date().isoformat())
         self._lock = Lock()
-        self._current_day: str | None = None
-        self._spent_today = 0
         self._in_flight = 0
+        self._db_path = ledger_db_path
+        self._persistent_conn: sqlite3.Connection | None = None
+        if self._db_path == ":memory:":
+            self._persistent_conn = sqlite3.connect(":memory:", check_same_thread=False)
+            self._persistent_conn.row_factory = sqlite3.Row
+        with self._lock, self._connect() as conn:
+            conn.executescript(_BUDGET_SCHEMA)
 
-    def _roll_day_if_needed_locked(self) -> None:
-        day = self._day_provider()
-        if day != self._current_day:
-            self._current_day = day
-            self._spent_today = 0
+    def _connect(self) -> sqlite3.Connection:
+        if self._persistent_conn is not None:
+            return self._persistent_conn
+        conn = sqlite3.connect(self._db_path, timeout=5)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _state_locked(self, conn: sqlite3.Connection) -> tuple[str, int, int]:
+        today = self._day_provider()
+        row = conn.execute(
+            "SELECT day, reserved_credits, spent_credits FROM budget_state WHERE scope = ?",
+            (self._scope,),
+        ).fetchone()
+        if row is None or row["day"] != today:
+            conn.execute(
+                "INSERT INTO budget_state (scope, day, reserved_credits, spent_credits) "
+                "VALUES (?, ?, 0, 0) "
+                "ON CONFLICT(scope) DO UPDATE SET day = excluded.day, "
+                "reserved_credits = 0, spent_credits = 0",
+                (self._scope, today),
+            )
+            return today, 0, 0
+        return row["day"], row["reserved_credits"], row["spent_credits"]
+
+    def _check_locked(self, conn: sqlite3.Connection, estimated_credits: int | None) -> BudgetDecision:
+        if estimated_credits is None and not self._allow_unknown:
+            return BudgetDecision(False, "unknown_credits_not_allowed")
+        if (
+            self._per_query_limit is not None
+            and estimated_credits is not None
+            and estimated_credits > self._per_query_limit
+        ):
+            return BudgetDecision(False, "per_query_credit_limit_exceeded")
+        _, reserved, spent = self._state_locked(conn)
+        if self._daily_budget is not None:
+            projected = spent + reserved + (estimated_credits or 0)
+            if projected > self._daily_budget:
+                return BudgetDecision(False, "daily_budget_exhausted")
+        if self._max_concurrent is not None and self._in_flight >= self._max_concurrent:
+            return BudgetDecision(False, "max_concurrent_calls_reached")
+        return BudgetDecision(True)
 
     def check_query(self, estimated_credits: int | None) -> BudgetDecision:
-        with self._lock:
-            self._roll_day_if_needed_locked()
-            if (
-                self._per_query_limit is not None
-                and estimated_credits is not None
-                and estimated_credits > self._per_query_limit
-            ):
-                return BudgetDecision(False, "per_query_credit_limit_exceeded")
-            if self._daily_budget is not None:
-                projected = self._spent_today + (estimated_credits or 0)
-                if projected > self._daily_budget:
-                    return BudgetDecision(False, "daily_budget_exhausted")
-            if self._max_concurrent is not None and self._in_flight >= self._max_concurrent:
-                return BudgetDecision(False, "max_concurrent_calls_reached")
-            return BudgetDecision(True)
+        with self._lock, self._connect() as conn:
+            return self._check_locked(conn, estimated_credits)
 
     @contextmanager
-    def reserve(self, estimated_credits: int | None = None) -> Iterator[None]:
-        decision = self.check_query(estimated_credits)
-        if not decision.allowed:
-            raise BudgetExceeded(decision.reason or "budget_exceeded")
-        with self._lock:
+    def reserve(self, estimated_credits: int | None = None) -> Iterator[ReservationHandle]:
+        reserved_amount = estimated_credits or 0
+        with self._lock, self._connect() as conn:
+            decision = self._check_locked(conn, estimated_credits)
+            if not decision.allowed:
+                raise BudgetExceeded(decision.reason or "budget_exceeded")
+            self._state_locked(conn)  # ensures the day row exists/rolled over
+            conn.execute(
+                "UPDATE budget_state SET reserved_credits = reserved_credits + ? WHERE scope = ?",
+                (reserved_amount, self._scope),
+            )
             self._in_flight += 1
+
+        handle = ReservationHandle()
         try:
-            yield
+            yield handle
         finally:
-            with self._lock:
+            actual = handle.actual_credits if handle.actual_credits is not None else 0
+            with self._lock, self._connect() as conn:
                 self._in_flight -= 1
+                conn.execute(
+                    "UPDATE budget_state SET reserved_credits = reserved_credits - ?, "
+                    "spent_credits = spent_credits + ? WHERE scope = ?",
+                    (reserved_amount, actual, self._scope),
+                )
 
     def record_spend(self, credits: int) -> None:
-        with self._lock:
-            self._roll_day_if_needed_locked()
-            self._spent_today += credits
+        """Direct spend outside of `reserve()` (e.g. backfilling a known
+        cost). Prefer `reserve()` + `handle.commit()` for real call sites
+        so the daily budget check accounts for in-flight reservations."""
+
+        with self._lock, self._connect() as conn:
+            self._state_locked(conn)
+            conn.execute(
+                "UPDATE budget_state SET spent_credits = spent_credits + ? WHERE scope = ?",
+                (credits, self._scope),
+            )
 
     @property
     def spent_today(self) -> int:
-        with self._lock:
-            self._roll_day_if_needed_locked()
-            return self._spent_today
+        with self._lock, self._connect() as conn:
+            _, _, spent = self._state_locked(conn)
+            return spent
+
+    @property
+    def reserved_now(self) -> int:
+        with self._lock, self._connect() as conn:
+            _, reserved, _ = self._state_locked(conn)
+            return reserved
 
     @property
     def in_flight(self) -> int:

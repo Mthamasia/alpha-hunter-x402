@@ -21,7 +21,7 @@ DEFAULT_AHX_BRIDGE_URL = "http://127.0.0.1:8787"
 DEFAULT_AHX_BRIDGE_TIMEOUT_SECONDS = 3.0
 DEFAULT_PREVIEW_CACHE_TTL_SECONDS = 60.0
 DEFAULT_PREVIEW_RATE_LIMIT_PER_MINUTE = 30
-DEFAULT_HELIUS_CREDIT_COST_USD = "0"
+DEFAULT_HELIUS_CREDIT_COST_USD = None  # None = not configured; never silently priced as 0
 # ":memory:" = telemetry is not persisted unless the operator explicitly
 # sets TELEMETRY_DB_PATH. Safer default for this stage: no new on-disk
 # footprint until someone opts in.
@@ -57,8 +57,26 @@ class Settings:
     # enforced yet; this stage only prepares the instrumentation.
     helius_daily_budget_credits: int | None = None
     helius_per_query_credit_limit: int | None = None
-    helius_credit_cost_usd: Decimal = Decimal(DEFAULT_HELIUS_CREDIT_COST_USD)
+    # None = no verified $/credit rate configured. A positive confirmed/
+    # estimated credit count with this still None must price as unknown,
+    # never as 0 -- see app/telemetry.py:build_record.
+    helius_credit_cost_usd: Decimal | None = DEFAULT_HELIUS_CREDIT_COST_USD
     telemetry_db_path: str = DEFAULT_TELEMETRY_DB_PATH
+    # Persistent preview quota + API keys (app/quota.py). ":memory:" by
+    # default for the same reason as telemetry: no new on-disk footprint
+    # until an operator opts in. In production this MUST be a real,
+    # persistent path (a Railway volume or equivalent) -- see README.
+    quota_db_path: str = DEFAULT_TELEMETRY_DB_PATH
+    # None = trust nothing but the raw transport-level peer address.
+    # Setting this to e.g. "X-Forwarded-For" is only safe once Railway's
+    # actual edge/proxy behavior for this exact header is confirmed.
+    trusted_proxy_header: str | None = None
+    quota_anonymous_per_minute: int = 10
+    quota_anonymous_per_day: int = 50
+    quota_anonymous_distinct_mints_per_day: int = 15
+    quota_registered_per_minute: int = 30
+    quota_registered_per_day: int = 300
+    quota_registered_distinct_mints_per_day: int = 60
 
     def __post_init__(self) -> None:
         if self.app_env not in APP_ENVS:
@@ -84,8 +102,14 @@ class Settings:
             raise ConfigError("HELIUS_DAILY_BUDGET_CREDITS não pode ser negativo.")
         if self.helius_per_query_credit_limit is not None and self.helius_per_query_credit_limit < 0:
             raise ConfigError("HELIUS_PER_QUERY_CREDIT_LIMIT não pode ser negativo.")
-        if self.helius_credit_cost_usd < 0:
+        if self.helius_credit_cost_usd is not None and self.helius_credit_cost_usd < 0:
             raise ConfigError("HELIUS_CREDIT_COST_USD não pode ser negativo.")
+        for name in (
+            "quota_anonymous_per_minute", "quota_anonymous_per_day", "quota_anonymous_distinct_mints_per_day",
+            "quota_registered_per_minute", "quota_registered_per_day", "quota_registered_distinct_mints_per_day",
+        ):
+            if getattr(self, name) <= 0:
+                raise ConfigError(f"{name.upper()} deve ser maior que zero.")
         if self.intelligence_provider == "alpha_hunter":
             self._validate_ahx_bridge()
         self._validate_public_base_url()
@@ -258,8 +282,9 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         )
     except ValueError as exc:
         raise ConfigError("PREVIEW_RATE_LIMIT_PER_MINUTE deve ser um inteiro.") from exc
+    raw_credit_cost = os.getenv("HELIUS_CREDIT_COST_USD", "").strip()
     try:
-        credit_cost = Decimal(os.getenv("HELIUS_CREDIT_COST_USD", DEFAULT_HELIUS_CREDIT_COST_USD).strip())
+        credit_cost = Decimal(raw_credit_cost) if raw_credit_cost else DEFAULT_HELIUS_CREDIT_COST_USD
     except InvalidOperation as exc:
         raise ConfigError("HELIUS_CREDIT_COST_USD deve ser numérico.") from exc
 
@@ -290,4 +315,14 @@ def load_settings(env_file: str | None = ".env") -> Settings:
             os.getenv("TELEMETRY_DB_PATH", DEFAULT_TELEMETRY_DB_PATH).strip()
             or DEFAULT_TELEMETRY_DB_PATH
         ),
+        quota_db_path=(
+            os.getenv("QUOTA_DB_PATH", DEFAULT_TELEMETRY_DB_PATH).strip() or DEFAULT_TELEMETRY_DB_PATH
+        ),
+        trusted_proxy_header=(os.getenv("TRUSTED_PROXY_HEADER", "").strip() or None),
+        quota_anonymous_per_minute=_int_or_none("QUOTA_ANONYMOUS_PER_MINUTE") or 10,
+        quota_anonymous_per_day=_int_or_none("QUOTA_ANONYMOUS_PER_DAY") or 50,
+        quota_anonymous_distinct_mints_per_day=_int_or_none("QUOTA_ANONYMOUS_DISTINCT_MINTS_PER_DAY") or 15,
+        quota_registered_per_minute=_int_or_none("QUOTA_REGISTERED_PER_MINUTE") or 30,
+        quota_registered_per_day=_int_or_none("QUOTA_REGISTERED_PER_DAY") or 300,
+        quota_registered_distinct_mints_per_day=_int_or_none("QUOTA_REGISTERED_DISTINCT_MINTS_PER_DAY") or 60,
     )

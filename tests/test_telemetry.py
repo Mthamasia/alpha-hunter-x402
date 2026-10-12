@@ -4,7 +4,7 @@ import pytest
 
 from app.telemetry import (
     REVENUE_NONE,
-    REVENUE_REAL,
+    REVENUE_SETTLED,
     ROUTE_INVESTIGATE,
     ROUTE_PREVIEW,
     SERVED_FROM_BRIDGE,
@@ -63,12 +63,64 @@ def test_unknown_credits_never_priced_as_zero():
         served_from=SERVED_FROM_BRIDGE,
         usage=usage,
         revenue_usd=Decimal("0.05"),
-        revenue_kind=REVENUE_REAL,
+        revenue_kind=REVENUE_SETTLED,
         credit_cost_usd=Decimal("0.001"),
     )
 
     assert record.cost_usd_estimated is None
     assert record.margin_usd_estimated is None  # cost unknown -> margin unknown
+
+
+def test_known_credits_without_a_configured_rate_is_unknown_cost_not_zero():
+    """The audit's blocker #3: a positive, confirmed credit count must
+    never be priced as 0 just because nobody configured
+    HELIUS_CREDIT_COST_USD. Only an EXPLICIT rate (including an explicit
+    0) may price it."""
+
+    tracker = HeliusCallTracker()
+    with tracker.attempt("getAsset") as a:
+        a.mark_credits(confirmed=100)
+
+    usage = tracker.summary()
+    assert not usage.credits_unknown  # the credits themselves ARE known
+
+    record = build_record(
+        request_id="r-rate-unconfigured",
+        route=ROUTE_INVESTIGATE,
+        chain="solana",
+        mint="MINT",
+        agent_id=None,
+        served_from=SERVED_FROM_BRIDGE,
+        usage=usage,
+        revenue_usd=Decimal("0.05"),
+        revenue_kind=REVENUE_SETTLED,
+        credit_cost_usd=None,  # not configured
+    )
+
+    assert record.cost_usd_estimated is None
+    assert record.margin_usd_estimated is None
+
+
+def test_explicit_zero_rate_is_honored_as_a_real_zero_cost():
+    tracker = HeliusCallTracker()
+    with tracker.attempt("getAsset") as a:
+        a.mark_credits(confirmed=100)
+
+    record = build_record(
+        request_id="r-rate-zero",
+        route=ROUTE_INVESTIGATE,
+        chain="solana",
+        mint="MINT",
+        agent_id=None,
+        served_from=SERVED_FROM_BRIDGE,
+        usage=tracker.summary(),
+        revenue_usd=Decimal("0.05"),
+        revenue_kind=REVENUE_SETTLED,
+        credit_cost_usd=Decimal("0"),  # explicitly configured as free
+    )
+
+    assert record.cost_usd_estimated == "0"
+    assert record.margin_usd_estimated == "0.05"
 
 
 def test_confirmed_and_estimated_credits_summed_and_priced():
@@ -92,7 +144,7 @@ def test_confirmed_and_estimated_credits_summed_and_priced():
         served_from=SERVED_FROM_BRIDGE,
         usage=usage,
         revenue_usd=Decimal("0.05"),
-        revenue_kind=REVENUE_REAL,
+        revenue_kind=REVENUE_SETTLED,
         credit_cost_usd=Decimal("0.001"),
     )
 
@@ -139,7 +191,7 @@ def test_record_query_raw_calls_json_round_trips():
         agent_id="agent-1",
         served_from=SERVED_FROM_BRIDGE,
         revenue_usd=Decimal("0.05"),
-        revenue_kind=REVENUE_REAL,
+        revenue_kind=REVENUE_SETTLED,
         credit_cost_usd=Decimal("0.001"),
     )
 
@@ -169,7 +221,7 @@ def test_ledger_aggregates_by_mint_agent_and_period():
             agent_id=agent,
             served_from=SERVED_FROM_BRIDGE,
             revenue_usd=revenue,
-            revenue_kind=REVENUE_REAL if revenue is not None else REVENUE_NONE,
+            revenue_kind=REVENUE_SETTLED if revenue is not None else REVENUE_NONE,
             credit_cost_usd=Decimal("0.001"),
         )
 
@@ -211,7 +263,7 @@ def test_ledger_never_sums_a_partial_total_when_cost_is_unknown():
         agent_id=None,
         served_from=SERVED_FROM_BRIDGE,
         revenue_usd=Decimal("0.05"),
-        revenue_kind=REVENUE_REAL,
+        revenue_kind=REVENUE_SETTLED,
         credit_cost_usd=Decimal("0.001"),
     )
 
@@ -221,6 +273,31 @@ def test_ledger_never_sums_a_partial_total_when_cost_is_unknown():
     assert totals["margin_usd_estimated_total"] is None
     # Revenue is still known and summed even when cost is not.
     assert totals["revenue_usd_total"] == "0.05"
+
+
+def test_purge_older_than_removes_only_rows_before_cutoff():
+    ledger = CostLedger(":memory:")
+
+    for ts in ("2026-01-01T00:00:00Z", "2026-06-01T00:00:00Z", "2026-10-01T00:00:00Z"):
+        record_query(
+            ledger,
+            tracker=HeliusCallTracker(),
+            request_id=new_request_id(),
+            route=ROUTE_PREVIEW,
+            chain="solana",
+            mint="MINT",
+            agent_id=None,
+            served_from=SERVED_FROM_CACHE,
+            revenue_usd=None,
+            revenue_kind=REVENUE_NONE,
+            credit_cost_usd=None,
+            now=__import__("datetime").datetime.fromisoformat(ts.replace("Z", "+00:00")),
+        )
+
+    removed = ledger.purge_older_than("2026-06-01T00:00:00Z")
+    assert removed == 1
+    remaining = sorted(r["timestamp"] for r in ledger.all_records())
+    assert remaining == ["2026-06-01T00:00:00Z", "2026-10-01T00:00:00Z"]
 
 
 def test_ledger_db_path_is_separate_from_intelligence_database(tmp_path):
@@ -265,8 +342,16 @@ class FakeClock:
         self.now += seconds
 
 
+def test_budget_guard_rejects_unknown_credits_by_default():
+    guard = BudgetGuard(ledger_db_path=":memory:", daily_budget_credits=10, per_query_credit_limit=None)
+
+    decision = guard.check_query(None)
+    assert not decision.allowed
+    assert decision.reason == "unknown_credits_not_allowed"
+
+
 def test_budget_guard_blocks_when_daily_budget_exhausted():
-    guard = BudgetGuard(daily_budget_credits=10, per_query_credit_limit=None)
+    guard = BudgetGuard(ledger_db_path=":memory:", daily_budget_credits=10, per_query_credit_limit=None)
 
     assert guard.check_query(5).allowed
     guard.record_spend(5)
@@ -279,7 +364,7 @@ def test_budget_guard_blocks_when_daily_budget_exhausted():
 
 
 def test_budget_guard_blocks_per_query_limit_regardless_of_daily_spend():
-    guard = BudgetGuard(daily_budget_credits=1000, per_query_credit_limit=5)
+    guard = BudgetGuard(ledger_db_path=":memory:", daily_budget_credits=1000, per_query_credit_limit=5)
 
     decision = guard.check_query(6)
     assert not decision.allowed
@@ -288,11 +373,56 @@ def test_budget_guard_blocks_per_query_limit_regardless_of_daily_spend():
     assert guard.check_query(5).allowed
 
 
+def test_budget_guard_reserve_blocks_daily_budget_from_in_flight_reservations_not_just_spend():
+    """The bug this guard previously had: a second concurrent reservation
+    could pass `check_query` because only confirmed `spent` counted, not
+    what a first in-flight call had already reserved."""
+
+    guard = BudgetGuard(ledger_db_path=":memory:", daily_budget_credits=10, per_query_credit_limit=None)
+
+    with guard.reserve(estimated_credits=8):
+        assert guard.reserved_now == 8
+        decision = guard.check_query(5)  # 8 reserved + 5 would be 13 > 10
+        assert not decision.allowed
+        assert decision.reason == "daily_budget_exhausted"
+        with pytest.raises(BudgetExceeded):
+            with guard.reserve(estimated_credits=5):
+                pass
+
+    assert guard.reserved_now == 0
+    assert guard.spent_today == 0  # never committed -> full rollback
+
+
+def test_budget_guard_reserve_commit_moves_reserved_into_spent():
+    guard = BudgetGuard(ledger_db_path=":memory:", daily_budget_credits=10, per_query_credit_limit=None)
+
+    with guard.reserve(estimated_credits=8) as handle:
+        assert guard.reserved_now == 8
+        handle.commit(actual_credits=6)  # actual RPC cost less than the estimate
+
+    assert guard.reserved_now == 0
+    assert guard.spent_today == 6
+
+
+def test_budget_guard_reserve_rolls_back_fully_on_exception():
+    guard = BudgetGuard(ledger_db_path=":memory:", daily_budget_credits=10, per_query_credit_limit=None)
+
+    with pytest.raises(RuntimeError):
+        with guard.reserve(estimated_credits=8):
+            raise RuntimeError("the RPC call blew up before any spend was known")
+
+    assert guard.reserved_now == 0
+    assert guard.spent_today == 0
+    assert guard.in_flight == 0
+
+
 def test_budget_guard_blocks_max_concurrent_calls():
     guard = BudgetGuard(
+        ledger_db_path=":memory:",
         daily_budget_credits=None,
         per_query_credit_limit=None,
         max_concurrent_calls=1,
+        allow_unknown_credits=True,
     )
 
     with guard.reserve():
@@ -312,6 +442,7 @@ def test_budget_guard_blocks_max_concurrent_calls():
 def test_budget_guard_resets_daily_spend_on_new_day():
     days = iter(["2026-10-12", "2026-10-12", "2026-10-13"])
     guard = BudgetGuard(
+        ledger_db_path=":memory:",
         daily_budget_credits=10,
         per_query_credit_limit=None,
         day_provider=lambda: next(days),
@@ -321,3 +452,49 @@ def test_budget_guard_resets_daily_spend_on_new_day():
     assert guard.spent_today == 8  # still 2026-10-12
 
     assert guard.spent_today == 0  # rolled over to 2026-10-13
+
+
+def test_budget_guard_persists_spend_across_a_simulated_restart(tmp_path):
+    db_path = str(tmp_path / "telemetry.db")
+
+    guard_before_restart = BudgetGuard(ledger_db_path=db_path, daily_budget_credits=10, per_query_credit_limit=None)
+    guard_before_restart.record_spend(7)
+
+    # A brand-new BudgetGuard instance, same file -- simulates a Railway
+    # redeploy picking the process back up.
+    guard_after_restart = BudgetGuard(ledger_db_path=db_path, daily_budget_credits=10, per_query_credit_limit=None)
+
+    assert guard_after_restart.spent_today == 7
+    decision = guard_after_restart.check_query(4)  # 7 + 4 == 11 > 10
+    assert not decision.allowed
+    assert decision.reason == "daily_budget_exhausted"
+
+
+def test_budget_guard_reserve_is_atomic_under_thread_concurrency():
+    """20 threads each try to reserve 1 credit against a budget of 10.
+    Exactly 10 must succeed; the rest must be rejected by the guard, not
+    by a race that lets the total exceed the budget."""
+
+    import threading
+
+    guard = BudgetGuard(ledger_db_path=":memory:", daily_budget_credits=10, per_query_credit_limit=None)
+    successes = []
+    lock = threading.Lock()
+
+    def worker():
+        try:
+            with guard.reserve(estimated_credits=1) as handle:
+                with lock:
+                    successes.append(1)
+                handle.commit(actual_credits=1)
+        except BudgetExceeded:
+            pass
+
+    threads = [threading.Thread(target=worker) for _ in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(successes) == 10
+    assert guard.spent_today == 10
