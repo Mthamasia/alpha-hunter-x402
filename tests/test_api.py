@@ -135,3 +135,31 @@ def test_stub_never_fabricates_intelligence(client):
         }
         assert body["data_quality"]["status"] == "UNAVAILABLE"
         assert any("Alpha Hunter" in s for s in body["data_quality"]["limitations"])
+
+def test_public_service_index_and_x402_discovery(client):
+    root = client.get("/")
+    assert root.status_code == 200
+    assert root.json()["x402_discovery"] == "/.well-known/x402"
+    assert root.json()["website"].startswith("https://")
+    assert root.headers["X-Content-Type-Options"] == "nosniff"
+
+    manifest = client.get("/.well-known/x402")
+    assert manifest.status_code == 200
+    payload = manifest.json()
+    assert payload["format"] == "ahx-discovery-v1"
+    assert payload["resource"]["method"] == "POST"
+    assert payload["resource"]["path"] == URL
+    assert payload["resource"]["example_request"]["chain"] == "solana"
+    assert payload["payment"]["protocol"] == "x402"
+    assert payload["payment"]["mode"] == "disabled"
+    assert "private" not in str(payload).lower()
+    assert "token" not in str(payload.get("payment", {})).lower()
+    assert client.post("/.well-known/x402", json={}).status_code == 405
+
+
+def test_discovery_does_not_bypass_paid_gate(paid_client):
+    discovery = paid_client.get("/.well-known/x402")
+    assert discovery.status_code == 200
+    assert discovery.json()["payment"]["mode"] == "test"
+    investigate = paid_client.post(URL, json={"chain": "solana", "mint": WSOL_MINT})
+    assert investigate.status_code == 402
