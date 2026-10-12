@@ -13,6 +13,7 @@ from app.quota import (
     TIER_FREE_KEY,
     QuotaStore,
     TierLimits,
+    hash_identifier,
     hash_key,
 )
 
@@ -206,6 +207,56 @@ def test_fails_closed_when_store_is_unavailable(monkeypatch):
     decision = store.check_and_consume("ip:1.2.3.4", TIER_ANONYMOUS, "MINT-A")
     assert not decision.allowed
     assert decision.reason == REASON_STORE_UNAVAILABLE
+
+
+# ---------------------------------------------------------------- retention / expiry
+
+
+def test_purge_expired_removes_only_past_buckets_not_the_current_one():
+    store, clock = make_store()
+
+    store.check_and_consume("ip:1.1.1.1", TIER_ANONYMOUS, "MINT-A")  # this minute/day
+
+    removed = store.purge_expired()
+    assert removed == {"quota_minute": 0, "quota_day": 0, "quota_mints_seen": 0}
+
+    clock.advance(minutes=1)  # new minute bucket, same day
+    removed = store.purge_expired()
+    assert removed["quota_minute"] == 1  # last minute's row is gone
+    assert removed["quota_day"] == 0  # still today
+    assert removed["quota_mints_seen"] == 0  # still today
+
+    clock.advance(days=1)
+    removed = store.purge_expired()
+    assert removed["quota_day"] == 1
+    assert removed["quota_mints_seen"] == 1
+
+
+def test_purge_expired_does_not_affect_quota_correctness_for_the_current_window():
+    store, clock = make_store()
+
+    store.check_and_consume("ip:1.1.1.1", TIER_ANONYMOUS, "MINT-A")
+    store.check_and_consume("ip:1.1.1.1", TIER_ANONYMOUS, "MINT-A")
+    store.purge_expired()  # nothing expired yet -- must not reset the live counter
+    assert not store.check_and_consume("ip:1.1.1.1", TIER_ANONYMOUS, "MINT-A").allowed
+
+
+# ---------------------------------------------------------------- IP pseudonymization
+
+
+def test_hash_identifier_is_deterministic_and_not_the_raw_value():
+    digest = hash_identifier("203.0.113.7")
+    assert digest != "203.0.113.7"
+    assert digest == hash_identifier("203.0.113.7")  # same input -> same subject, no secret
+    assert len(digest) == 64  # sha256 hex
+
+
+def test_hash_identifier_with_secret_differs_from_unsalted_and_is_still_deterministic():
+    salted = hash_identifier("203.0.113.7", "a-server-side-salt")
+    unsalted = hash_identifier("203.0.113.7")
+    assert salted != unsalted
+    assert salted == hash_identifier("203.0.113.7", "a-server-side-salt")
+    assert salted != hash_identifier("203.0.113.7", "a-different-salt")
 
 
 def test_check_and_consume_is_atomic_under_thread_concurrency():

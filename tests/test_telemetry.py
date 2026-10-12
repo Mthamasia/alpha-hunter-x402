@@ -380,7 +380,7 @@ def test_budget_guard_reserve_blocks_daily_budget_from_in_flight_reservations_no
 
     guard = BudgetGuard(ledger_db_path=":memory:", daily_budget_credits=10, per_query_credit_limit=None)
 
-    with guard.reserve(estimated_credits=8):
+    with guard.reserve(estimated_credits=8) as handle:
         assert guard.reserved_now == 8
         decision = guard.check_query(5)  # 8 reserved + 5 would be 13 > 10
         assert not decision.allowed
@@ -388,9 +388,10 @@ def test_budget_guard_reserve_blocks_daily_budget_from_in_flight_reservations_no
         with pytest.raises(BudgetExceeded):
             with guard.reserve(estimated_credits=5):
                 pass
+        handle.cancel()  # this attempt definitely never reached Helius
 
     assert guard.reserved_now == 0
-    assert guard.spent_today == 0  # never committed -> full rollback
+    assert guard.spent_today == 0  # explicitly cancelled -> real zero cost, not a guess
 
 
 def test_budget_guard_reserve_commit_moves_reserved_into_spent():
@@ -404,7 +405,12 @@ def test_budget_guard_reserve_commit_moves_reserved_into_spent():
     assert guard.spent_today == 6
 
 
-def test_budget_guard_reserve_rolls_back_fully_on_exception():
+def test_budget_guard_reserve_charges_full_reservation_on_an_ambiguous_exception():
+    """P2 from the independent audit: a timeout/error during the RPC call
+    does not prove Helius never billed the attempt. The guard must not
+    assume zero cost just because the outcome is unknown -- it charges
+    the full reservation (the conservative upper bound) instead."""
+
     guard = BudgetGuard(ledger_db_path=":memory:", daily_budget_credits=10, per_query_credit_limit=None)
 
     with pytest.raises(RuntimeError):
@@ -412,8 +418,30 @@ def test_budget_guard_reserve_rolls_back_fully_on_exception():
             raise RuntimeError("the RPC call blew up before any spend was known")
 
     assert guard.reserved_now == 0
-    assert guard.spent_today == 0
+    assert guard.spent_today == 8  # charged conservatively, not rolled back to 0
     assert guard.in_flight == 0
+
+
+def test_budget_guard_reserve_cancel_is_the_only_way_to_get_a_real_zero_cost():
+    guard = BudgetGuard(ledger_db_path=":memory:", daily_budget_credits=10, per_query_credit_limit=None)
+
+    with guard.reserve(estimated_credits=8) as handle:
+        handle.cancel()  # e.g. input validation failed before any request was sent
+
+    assert guard.reserved_now == 0
+    assert guard.spent_today == 0
+
+
+def test_budget_guard_reserve_forgetting_to_commit_also_charges_conservatively():
+    """Not just exceptions: simply forgetting to call `.commit()` or
+    `.cancel()` must not default to a free pass either."""
+
+    guard = BudgetGuard(ledger_db_path=":memory:", daily_budget_credits=10, per_query_credit_limit=None)
+
+    with guard.reserve(estimated_credits=8):
+        pass  # neither commit() nor cancel() called
+
+    assert guard.spent_today == 8
 
 
 def test_budget_guard_blocks_max_concurrent_calls():

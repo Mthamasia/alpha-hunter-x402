@@ -513,17 +513,34 @@ CREATE TABLE IF NOT EXISTS budget_state (
 
 
 class ReservationHandle:
-    """Yielded by `BudgetGuard.reserve()`. Call `.commit(actual_credits)`
-    before the `with` block ends to move the reservation into confirmed
-    spend. If `.commit()` is never called (e.g. an exception was raised
-    before any real work happened), the reservation is released with
-    zero spend -- a full rollback."""
+    """Yielded by `BudgetGuard.reserve()`. Three ways a reservation can
+    end, and the budget accounting is deliberately asymmetric between
+    them:
+
+    - `.commit(actual_credits)`: the call completed and its real cost is
+      known. Moves exactly `actual_credits` from reserved into spent.
+    - `.cancel()`: the call definitely never reached Helius (e.g. input
+      validation failed before any request was sent). Safe to roll back
+      the full reservation with zero spend.
+    - Neither called (the `with` block exits some other way, typically
+      an exception during the RPC call itself): AMBIGUOUS, not a free
+      pass. A timeout or connection error does not prove Helius never
+      billed the attempt. The full originally-reserved amount is charged
+      as spent -- conservative, so the tracked daily budget can never
+      understate real usage because of an unconfirmed outcome. Call
+      `.cancel()` explicitly whenever "definitely free" is actually
+      known, rather than relying on this default.
+    """
 
     def __init__(self) -> None:
         self.actual_credits: int | None = None
+        self.cancelled: bool = False
 
     def commit(self, actual_credits: int) -> None:
         self.actual_credits = actual_credits
+
+    def cancel(self) -> None:
+        self.cancelled = True
 
 
 class BudgetGuard:
@@ -643,7 +660,14 @@ class BudgetGuard:
         try:
             yield handle
         finally:
-            actual = handle.actual_credits if handle.actual_credits is not None else 0
+            if handle.actual_credits is not None:
+                actual = handle.actual_credits  # confirmed real cost
+            elif handle.cancelled:
+                actual = 0  # confirmed never reached Helius
+            else:
+                # Ambiguous exit (e.g. an exception during the RPC call):
+                # charge the full reservation rather than assume zero.
+                actual = reserved_amount
             with self._lock, self._connect() as conn:
                 self._in_flight -= 1
                 conn.execute(

@@ -30,6 +30,7 @@ than falling back to unlimited access.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import logging
 import secrets
 import sqlite3
@@ -108,6 +109,20 @@ class IssuedKey:
 
 def hash_key(raw_key: str) -> str:
     return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+
+def hash_identifier(value: str, secret: str | None = None) -> str:
+    """Pseudonymizes an identifier (typically a client IP) before it is
+    ever used as a `subject_id`/stored in the quota tables. HMAC-SHA256
+    with an operator-configured secret (`QUOTA_IP_PSEUDONYMIZATION_SALT`) if one is
+    set -- otherwise plain SHA-256, which is still not the raw IP at
+    rest, but is reversible by anyone who can guess the input and
+    recompute the hash (no secret involved). Configuring the secret is
+    recommended before handling real anonymous traffic at scale."""
+
+    if secret:
+        return hmac.new(secret.encode("utf-8"), value.encode("utf-8"), hashlib.sha256).hexdigest()
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _minute_bucket(now: datetime) -> str:
@@ -251,3 +266,30 @@ class QuotaStore:
             f"ON CONFLICT(subject_id, bucket) DO UPDATE SET count = count + 1",
             (subject_id, bucket),
         )
+
+    # ---------------------------------------------------------- retention
+
+    def purge_expired(self) -> dict[str, int]:
+        """Deletes every bucket strictly older than the CURRENT minute/day
+        bucket. A past bucket has zero future enforcement value (quota
+        decisions only ever look at the current minute/day), so the
+        default retention for this data is "none beyond what is needed
+        right now" -- the most privacy-protective choice available and,
+        incidentally, the fix for unbounded table growth. Safe to call
+        at any time, including concurrently with `check_and_consume`
+        (each statement is its own short transaction under the lock).
+        """
+
+        now = self._now()
+        minute_bucket = _minute_bucket(now)
+        day_bucket = _day_bucket(now)
+        removed = {"quota_minute": 0, "quota_day": 0, "quota_mints_seen": 0}
+        with self._lock, self._connect() as conn:
+            for table, current in (
+                ("quota_minute", minute_bucket),
+                ("quota_day", day_bucket),
+                ("quota_mints_seen", day_bucket),
+            ):
+                cur = conn.execute(f"DELETE FROM {table} WHERE bucket < ?", (current,))
+                removed[table] = cur.rowcount
+        return removed

@@ -1,9 +1,10 @@
 import time
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
-from app.config import Settings
+from app.config import ConfigError, Settings
 from app.main import create_app
 from tests.conftest import WSOL_MINT
 
@@ -210,13 +211,80 @@ def test_preview_telemetry_records_agent_id_from_header(monkeypatch):
     assert totals["query_count"] == 1
 
 
+def test_trusted_proxy_header_requires_trusted_proxy_cidrs():
+    with pytest.raises(ConfigError, match="TRUSTED_PROXY_CIDRS"):
+        Settings(trusted_proxy_header="X-Forwarded-For")
+
+
+def test_trusted_proxy_cidrs_rejects_garbage():
+    with pytest.raises(ConfigError, match="TRUSTED_PROXY_CIDRS"):
+        Settings(trusted_proxy_header="X-Forwarded-For", trusted_proxy_cidrs=("not-a-cidr",))
+
+
+def test_forwarded_header_ignored_when_peer_is_not_a_trusted_proxy(monkeypatch):
+    """A header NAME being configured must not be enough on its own: the
+    immediate TCP peer (TestClient's default, 'testclient') is not inside
+    any trusted CIDR here, so the header must be ignored."""
+
+    app, _ = make_app(
+        monkeypatch,
+        lambda _u, _h: httpx.Response(200, json=bridge_payload()),
+        trusted_proxy_header="X-Forwarded-For",
+        trusted_proxy_cidrs=("10.0.0.0/8",),
+        quota_anonymous_per_minute=1,
+    )
+    client = TestClient(app)
+
+    # Two different claimed X-Forwarded-For values from the SAME untrusted
+    # peer must share one quota bucket (the header is ignored), not two.
+    r1 = client.post(URL, json={"chain": "solana", "mint": WSOL_MINT}, headers={"X-Forwarded-For": "1.1.1.1"})
+    r2 = client.post(URL, json={"chain": "solana", "mint": WSOL_MINT}, headers={"X-Forwarded-For": "2.2.2.2"})
+
+    assert r1.status_code == 200
+    assert r2.status_code == 429  # blocked under the same real-peer bucket, header spoofing had no effect
+
+
+def test_quota_subject_never_stores_the_raw_ip(monkeypatch, tmp_path):
+    quota_db = str(tmp_path / "quota.db")
+    app, _ = make_app(
+        monkeypatch,
+        lambda _u, _h: httpx.Response(200, json=bridge_payload()),
+        quota_db_path=quota_db,
+    )
+    client = TestClient(app)
+    client.post(URL, json={"chain": "solana", "mint": WSOL_MINT})
+
+    import sqlite3
+
+    conn = sqlite3.connect(quota_db)
+    subjects = [r[0] for r in conn.execute("SELECT DISTINCT subject_id FROM quota_minute")]
+    conn.close()
+
+    assert subjects  # at least one subject recorded
+    assert all("127.0.0.1" not in s and "testclient" not in s for s in subjects)
+    assert all(s.startswith("ip:") and len(s) == len("ip:") + 64 for s in subjects)  # sha256 hex
+
+
 def test_preview_never_calls_helius_on_any_path(monkeypatch):
-    """Absolute invariant: the free preview endpoint is database/cache
-    only. This test fails if ANY code path under /v1/token/preview ever
-    opens a socket to anything other than the (monkeypatched, loopback-
-    only per conftest.block_network) bridge call -- success, cache hit,
-    unknown mint, invalid mint, bridge 401/404/500, and quota-blocked are
-    all exercised here under one audit hook."""
+    """Scope of this test, precisely: this process (the Railway satellite)
+    never has any code path that calls Helius directly, under any
+    preview outcome -- success, cache hit, unknown mint, invalid mint,
+    bridge 401/404/500, quota-blocked. It fails if any of those paths
+    opens a socket to anything other than loopback (the bridge call
+    itself is monkeypatched here, same as the rest of this file -- a
+    real `httpx.Client.get` to the live bridge is network, which
+    conftest.block_network already forbids everywhere in this suite).
+
+    What this test does NOT and CANNOT prove: that the real, deployed
+    AHX bridge on the VPS -- a different process, different repo --
+    never calls Helius either. That guarantee lives in the AHX bridge's
+    own repository (its audit-hook tests assert zero RPC/websocket
+    imports and zero non-SQLite network connections when it handles a
+    request) and was independently re-verified read-only against the
+    live bridge; see docs/vps-bridge-read-only-audit.md for that
+    evidence. Both halves are needed for the full claim; this test is
+    only the Railway half.
+    """
 
     import sys
 

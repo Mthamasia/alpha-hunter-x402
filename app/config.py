@@ -71,6 +71,22 @@ class Settings:
     # Setting this to e.g. "X-Forwarded-For" is only safe once Railway's
     # actual edge/proxy behavior for this exact header is confirmed.
     trusted_proxy_header: str | None = None
+    # Only honor trusted_proxy_header when the immediate TCP peer's address
+    # falls inside one of these CIDR blocks -- a configured header NAME
+    # alone does not stop a client from sending it itself. Empty by
+    # default: TRUSTED_PROXY_HEADER has no effect until this is also set.
+    trusted_proxy_cidrs: tuple[str, ...] = ()
+    # HMAC secret for pseudonymizing client IPs before they become a quota
+    # subject_id. Strongly recommended in production; falls back to
+    # unsalted SHA-256 (still not the raw IP at rest, but guessable) if
+    # unset -- see app/quota.py:hash_identifier.
+    quota_ip_pseudonymization_salt: str | None = None
+    # Retention: how long telemetry rows are kept before periodic purge.
+    # Quota buckets have no separate setting -- they are purged down to
+    # "only the current minute/day bucket" (see QuotaStore.purge_expired),
+    # since a past bucket has zero future enforcement value.
+    telemetry_retention_days: int = 90
+    retention_purge_interval_seconds: int = 3600
     quota_anonymous_per_minute: int = 10
     quota_anonymous_per_day: int = 50
     quota_anonymous_distinct_mints_per_day: int = 15
@@ -107,9 +123,21 @@ class Settings:
         for name in (
             "quota_anonymous_per_minute", "quota_anonymous_per_day", "quota_anonymous_distinct_mints_per_day",
             "quota_registered_per_minute", "quota_registered_per_day", "quota_registered_distinct_mints_per_day",
+            "telemetry_retention_days", "retention_purge_interval_seconds",
         ):
             if getattr(self, name) <= 0:
                 raise ConfigError(f"{name.upper()} deve ser maior que zero.")
+        if self.trusted_proxy_header and not self.trusted_proxy_cidrs:
+            raise ConfigError(
+                "TRUSTED_PROXY_HEADER exige TRUSTED_PROXY_CIDRS: um nome de header configurado, "
+                "sem restringir de qual peer ele é aceito, não impede spoofing."
+            )
+        import ipaddress as _ipaddress
+        for cidr in self.trusted_proxy_cidrs:
+            try:
+                _ipaddress.ip_network(cidr, strict=False)
+            except ValueError as exc:
+                raise ConfigError(f"TRUSTED_PROXY_CIDRS contém um bloco inválido: {cidr!r}.") from exc
         if self.intelligence_provider == "alpha_hunter":
             self._validate_ahx_bridge()
         self._validate_public_base_url()
@@ -319,6 +347,12 @@ def load_settings(env_file: str | None = ".env") -> Settings:
             os.getenv("QUOTA_DB_PATH", DEFAULT_TELEMETRY_DB_PATH).strip() or DEFAULT_TELEMETRY_DB_PATH
         ),
         trusted_proxy_header=(os.getenv("TRUSTED_PROXY_HEADER", "").strip() or None),
+        trusted_proxy_cidrs=tuple(
+            c.strip() for c in os.getenv("TRUSTED_PROXY_CIDRS", "").split(",") if c.strip()
+        ),
+        quota_ip_pseudonymization_salt=(os.getenv("QUOTA_IP_PSEUDONYMIZATION_SALT", "").strip() or None),
+        telemetry_retention_days=_int_or_none("TELEMETRY_RETENTION_DAYS") or 90,
+        retention_purge_interval_seconds=_int_or_none("RETENTION_PURGE_INTERVAL_SECONDS") or 3600,
         quota_anonymous_per_minute=_int_or_none("QUOTA_ANONYMOUS_PER_MINUTE") or 10,
         quota_anonymous_per_day=_int_or_none("QUOTA_ANONYMOUS_PER_DAY") or 50,
         quota_anonymous_distinct_mints_per_day=_int_or_none("QUOTA_ANONYMOUS_DISTINCT_MINTS_PER_DAY") or 15,

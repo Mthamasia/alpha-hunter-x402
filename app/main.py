@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import ipaddress
 import logging
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -31,6 +34,8 @@ from app.quota import (
     TIER_FREE_KEY,
     QuotaStore,
     TierLimits,
+    hash_identifier,
+    hash_key,
 )
 from app.ratelimit import TTLCache
 from app.telemetry import (
@@ -86,13 +91,29 @@ def _agent_id(request: Request) -> str | None:
     return raw
 
 
-def _resolve_client_ip(request: Request, settings: Settings) -> str:
-    """Nothing is trusted by default: a client-supplied forwarded-for
-    header is exactly as spoofable as `X-Agent-Id` unless the operator
-    has explicitly confirmed which header their edge/proxy sets and
-    configured its exact name via TRUSTED_PROXY_HEADER."""
+def _peer_is_trusted_proxy(request: Request, settings: Settings) -> bool:
+    """A configured header NAME alone does not stop a client from simply
+    sending that header itself. The header is only honored when the
+    IMMEDIATE TCP peer's address is itself inside an operator-confirmed
+    CIDR allowlist (TRUSTED_PROXY_CIDRS) -- the standard "trusted hop"
+    model. Config validation already refuses TRUSTED_PROXY_HEADER without
+    TRUSTED_PROXY_CIDRS, so an empty list here just means nothing is
+    trusted yet, not a silent bypass."""
 
-    if settings.trusted_proxy_header:
+    if not settings.trusted_proxy_cidrs or not request.client:
+        return False
+    try:
+        peer = ipaddress.ip_address(request.client.host)
+    except ValueError:
+        return False
+    for cidr in settings.trusted_proxy_cidrs:
+        if peer in ipaddress.ip_network(cidr, strict=False):
+            return True
+    return False
+
+
+def _resolve_client_ip(request: Request, settings: Settings) -> str:
+    if settings.trusted_proxy_header and _peer_is_trusted_proxy(request, settings):
         value = request.headers.get(settings.trusted_proxy_header)
         if value:
             return value.split(",")[0].strip()
@@ -105,17 +126,20 @@ def _resolve_subject_and_tier(
     """Returns (subject_id, tier) for quota purposes. An API key always
     wins over IP if present and valid; an unknown/revoked key falls back
     to the anonymous IP-based subject rather than erroring, so a bad key
-    degrades to the free tier instead of blocking the request outright."""
+    degrades to the free tier instead of blocking the request outright.
+
+    The IP itself is never stored raw: it is pseudonymized (HMAC if
+    QUOTA_IP_PSEUDONYMIZATION_SALT is configured, else plain SHA-256) before it
+    becomes a subject_id, consistent with treating it as the personal
+    data it can be."""
 
     raw_key = request.headers.get(API_KEY_HEADER)
     if raw_key:
         tier = quota_store.resolve_key_tier(raw_key)
         if tier is not None:
-            from app.quota import hash_key
-
             return f"key:{hash_key(raw_key)}", tier
     ip = _resolve_client_ip(request, settings)
-    return f"ip:{ip}", TIER_ANONYMOUS
+    return f"ip:{hash_identifier(ip, settings.quota_ip_pseudonymization_salt)}", TIER_ANONYMOUS
 
 
 def _billable_intelligence(result: Any) -> bool:
@@ -165,7 +189,28 @@ def create_app(
         },
     )
 
-    app = FastAPI(title="AHX x402 API", version=__version__)
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        from app.retention import periodic_purge_loop
+
+        task = asyncio.create_task(
+            periodic_purge_loop(
+                quota_store,
+                cost_ledger,
+                interval_seconds=settings.retention_purge_interval_seconds,
+                telemetry_retention_days=settings.telemetry_retention_days,
+            )
+        )
+        try:
+            yield
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    app = FastAPI(title="AHX x402 API", version=__version__, lifespan=lifespan)
     app.state.settings = settings
     app.state.provider = provider
     app.state.gate = gate
@@ -209,15 +254,21 @@ def create_app(
             # verification failed before the route ran) and there is no
             # pending row to finalize either -- `finalize_revenue` is a
             # harmless no-op in that case.
+            #
+            # CRITICAL: a telemetry failure here must NEVER change what the
+            # client receives. A customer who paid and whose settlement
+            # already succeeded must get their 200 response even if SQLite
+            # itself is down right now -- that is a reconciliation problem,
+            # not a reason to turn a successful paid delivery into a 503.
+            # So this entire block is isolated: any exception is logged at
+            # CRITICAL (a real paid settlement whose revenue bookkeeping is
+            # now unreconciled, needing manual follow-up) and swallowed.
             settlement_header = response.headers.get(X402_SETTLEMENT_HEADER)
             request_id = _rid(request)
             if request_id:
-                if settlement_header:
-                    try:
+                try:
+                    if settlement_header:
                         settlement = decode_payment_response_header(settlement_header)
-                    except Exception:
-                        logger.exception("undecodable settlement response rid=%s", request_id)
-                    else:
                         if settlement.success:
                             cost_ledger.finalize_revenue(
                                 request_id, revenue_kind=REVENUE_SETTLED, revenue_usd=settings.price_usd
@@ -226,17 +277,26 @@ def create_app(
                             cost_ledger.finalize_revenue(
                                 request_id, revenue_kind=REVENUE_FAILED, revenue_usd=None
                             )
-                elif response.status_code != 200:
-                    # The library swaps a failed-settlement response for a
-                    # 402 with no PAYMENT-RESPONSE header at all (confirmed
-                    # empirically, not documented). `finalize_revenue` only
-                    # touches a row that is still PENDING, so this is a
-                    # harmless no-op for every other non-200 response that
-                    # never recorded a pending row in the first place (no
-                    # payment provided, validation errors, unreachable
-                    # facilitator, mainnet no-charge decisions, ...).
-                    cost_ledger.finalize_revenue(
-                        request_id, revenue_kind=REVENUE_FAILED, revenue_usd=None
+                    elif response.status_code != 200:
+                        # The library swaps a failed-settlement response for a
+                        # 402 with no PAYMENT-RESPONSE header at all (confirmed
+                        # empirically, not documented). `finalize_revenue` only
+                        # touches a row that is still PENDING, so this is a
+                        # harmless no-op for every other non-200 response that
+                        # never recorded a pending row in the first place (no
+                        # payment provided, validation errors, unreachable
+                        # facilitator, mainnet no-charge decisions, ...).
+                        cost_ledger.finalize_revenue(
+                            request_id, revenue_kind=REVENUE_FAILED, revenue_usd=None
+                        )
+                except Exception:
+                    logger.critical(
+                        "UNRECONCILED SETTLEMENT: telemetry finalization failed after a real "
+                        "x402 settlement outcome was already known (rid=%s, settled=%s). "
+                        "The client response was NOT altered. Manual reconciliation needed.",
+                        request_id,
+                        response.status_code == 200,
+                        exc_info=True,
                     )
             return response
 

@@ -5,6 +5,7 @@ facilitator falso que implementa o protocolo FacilitatorClient da biblioteca.
 Nenhum fundo Ã© movimentado e nenhuma chave privada Ã© usada.
 """
 
+import sqlite3
 from decimal import Decimal
 from pathlib import Path
 
@@ -316,6 +317,44 @@ def test_endpoint_error_never_creates_a_pending_row():
 
     assert fac.settle_calls == 0
     assert client.app.state.cost_ledger.all_records() == []
+
+
+def test_ledger_failure_after_settlement_never_overwrites_a_paid_response(monkeypatch):
+    """P1 from the independent audit of commit 4a0d053: if settlement
+    already succeeded and ONLY the telemetry write fails, the client must
+    still get their paid 200 response -- not a 503 that implies they were
+    never charged when they actually were."""
+
+    from app.telemetry import CostLedger
+
+    def boom(self, *args, **kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(CostLedger, "finalize_revenue", boom)
+
+    client, fac = make_x402_client()
+    req = get_requirements(client).accepts[0]
+    r = client.post(URL, json=REQ, headers={"PAYMENT-SIGNATURE": fake_signature_header(req)})
+
+    assert r.status_code == 200  # the paid response survives the telemetry failure
+    assert r.json()["status"] == "NO_DATA_SOURCE"
+    assert fac.settle_calls == 1
+
+
+def test_ledger_failure_after_failed_settlement_still_returns_the_correct_error(monkeypatch):
+    from app.telemetry import CostLedger
+
+    def boom(self, *args, **kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(CostLedger, "finalize_revenue", boom)
+
+    client, fac = make_x402_client(FakeFacilitator(settle_ok=False))
+    req = get_requirements(client).accepts[0]
+    r = client.post(URL, json=REQ, headers={"PAYMENT-SIGNATURE": fake_signature_header(req)})
+
+    assert r.status_code == 402  # unaffected by the telemetry failure
+    assert fac.settle_calls == 1
 
 
 def test_unreachable_facilitator_never_records_phantom_revenue():

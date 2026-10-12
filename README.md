@@ -117,16 +117,34 @@ replicas. Two tiers for this pilot (initial numbers, not final policy):
   with SHA-256, never stored or logged in plaintext, revocable by `key_id`)
   and the resolved client IP.
 - The resolved IP is, by default, the raw transport-level peer address.
-  Trusting a forwarded-for header requires explicitly setting
-  `TRUSTED_PROXY_HEADER` to its exact name -- nothing is trusted by default,
-  since an arbitrary client-supplied header is exactly as spoofable as
-  `X-Agent-Id`. **Open item**: Railway's actual edge/proxy header behavior for
-  this deployment has not been verified from this environment; do not set
-  `TRUSTED_PROXY_HEADER` until that is confirmed.
+  Trusting a forwarded-for header requires BOTH `TRUSTED_PROXY_HEADER` (its
+  exact name) AND `TRUSTED_PROXY_CIDRS` (the CIDR blocks the real edge/proxy
+  connects from) -- configuring the header name alone is refused at startup
+  (`ConfigError`), because a header *name* does not stop a client from simply
+  sending it itself. The header is only honored when the immediate TCP peer's
+  address falls inside `TRUSTED_PROXY_CIDRS`; otherwise it is ignored and the
+  raw peer address is used, even if the header is present. **Open item**:
+  Railway's actual edge/proxy IP ranges for this deployment have not been
+  confirmed from this environment; do not set `TRUSTED_PROXY_CIDRS` until
+  that is verified, or every anonymous caller may be bucketed under Railway's
+  single edge IP instead of their own.
+- The IP itself is never stored raw: before it becomes a quota `subject_id`
+  it is pseudonymized (`app/quota.py:hash_identifier`) -- HMAC-SHA256 if
+  `QUOTA_IP_PSEUDONYMIZATION_SALT` is configured, otherwise plain SHA-256
+  (still not the IP at rest, though guessable without a salt).
 - `app/ratelimit.py`'s `TTLCache`/`FixedWindowRateLimiter` remain as the
   response cache (`PREVIEW_CACHE_TTL_SECONDS`) -- not as quota enforcement --
   and are bounded (`max_entries`, LRU eviction) so a scan of many distinct
   mints/IPs cannot grow them without limit.
+- **Retention**: quota buckets keep no history beyond the current minute/day
+  -- a past bucket has zero future enforcement value, which is also the
+  simplest correct privacy posture. Telemetry rows are kept
+  `TELEMETRY_RETENTION_DAYS` (default 90). Both are actually purged, not just
+  purgeable: `app/retention.py` runs an `asyncio` loop from the FastAPI
+  lifespan every `RETENTION_PURGE_INTERVAL_SECONDS` (default 3600) calling
+  `QuotaStore.purge_expired()`/`CostLedger.purge_older_than()`. The retention
+  *period* itself is an operational default, not a compliance sign-off --
+  confirm it against your actual obligations before relying on it.
 
 ## Cost and revenue telemetry
 
@@ -164,20 +182,40 @@ Two things this stage's review specifically fixed:
   aggregates. `disabled` mode records `none`; `test` mode (synchronous,
   simulated, no real facilitator) records `simulated` immediately, same as
   before.
+- **A telemetry failure can never flip a paid response into an error.** The
+  finalization step above is isolated in its own `try`/`except`: if a real
+  settlement already succeeded and only the SQLite write afterwards fails,
+  the client still gets their 200. The failure is logged at `CRITICAL`
+  (`UNRECONCILED SETTLEMENT`) for manual follow-up instead of silently
+  swallowed or, worse, turned into a 503 for a customer who already paid.
 
 `BudgetGuard` is SQLite-backed (`ledger_db_path`) so its daily spend survives
 a restart, and its reservation is atomic: the check (per-query limit, daily
 budget -- including credits other in-flight calls have already reserved, not
 just confirmed spend -- and concurrency) and the reservation itself happen
-under the same lock and the same transaction. `reserve()` yields a handle;
-call `handle.commit(actual_credits)` to move the reservation into confirmed
-spend, or let the `with` block exit without committing for a full rollback
-(e.g. the RPC call raised before any cost was known). Unknown credit
-estimates are refused by default (`allow_unknown_credits=False`) -- an
-"unknown-cost" call must not be able to bypass every cap for free. All caps
-(`HELIUS_DAILY_BUDGET_CREDITS`, `HELIUS_PER_QUERY_CREDIT_LIMIT`) are unset by
-default; nothing is enforced until an operator configures them, and **nothing
-in this repository calls Helius yet either way.**
+under the same lock and the same transaction. `reserve()` yields a handle
+with three, deliberately asymmetric, outcomes:
+
+- `handle.commit(actual_credits)` -- the real cost is known; charge exactly that.
+- `handle.cancel()` -- the call definitely never reached Helius (e.g. input
+  validation failed before any request was sent); a real, confirmed zero cost.
+- Neither called (including when the `with` block exits via an exception,
+  e.g. an RPC timeout) -- **ambiguous, not free**: the full reservation is
+  charged. A timeout does not prove Helius never billed the attempt, so the
+  tracked budget must not understate real usage just because the outcome
+  is unconfirmed.
+
+Unknown credit estimates are refused by default (`allow_unknown_credits=False`)
+-- an "unknown-cost" call must not be able to bypass every cap for free. All
+caps (`HELIUS_DAILY_BUDGET_CREDITS`, `HELIUS_PER_QUERY_CREDIT_LIMIT`) are
+unset by default; nothing is enforced until an operator configures them, and
+**nothing in this repository calls Helius yet either way.**
+
+This repository's own code never calls Helius (verified by the tests above);
+it talks to the AHX bridge over HTTPS, and the bridge itself only ever reads
+SQLite. That second half of the claim is verified separately, read-only,
+against the live bridge -- see
+[docs/vps-bridge-read-only-audit.md](docs/vps-bridge-read-only-audit.md).
 
 `CostLedger.totals_by_mint/agent/period` answer "how much did this token /
 agent / period cost and earn" directly from the stored rows; a total is never
