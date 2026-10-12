@@ -66,10 +66,14 @@ pricing requirements, and includes the `x402-global-challenge` tag. Facilitators
 that support Bazaar can catalog the public resource after a successful public
 settlement.
 
-The installed Python x402 package does not ship its own Bazaar helper, so the
-metadata is declared directly in the route configuration using the published
-extension shape. This remains standard x402 metadata, not a custom discovery
-endpoint.
+The repository declares discovery metadata in the payment requirements.
+Bazaar indexing depends on the facilitator and has not been independently
+verified for the current Algorand Mainnet deployment.
+
+## Buyer materials
+
+- [No-wallet buyer quickstart and limitations](docs/buyer-quickstart.md)
+- [Evidence-first first-customer experiment](docs/first-customer-pilot.md)
 
 ## Testnet proof
 
@@ -87,8 +91,8 @@ keys, mnemonics, or bridge tokens in versioned files.
 | --- | --- |
 | `PAYMENT_MODE` | `disabled`, `test`, `x402-testnet`, or explicit `x402-mainnet`. |
 | `PRICE_USD` | Decimal price; `0.05` is `50000` USDC atomic units. |
-| `PAY_TO` | Required Algorand receiver in real x402 Testnet mode. |
-| `X402_NETWORK` | Testnet alias or Testnet CAIP-2 only. |
+| `PAY_TO` | Required Algorand receiver in real x402 Testnet and Mainnet modes. |
+| `X402_NETWORK` | Algorand Testnet or Mainnet alias/CAIP-2 matching `PAYMENT_MODE`. |
 | `X402_FACILITATOR_URL` | HTTPS x402 facilitator URL without credentials. |
 | `INTELLIGENCE_PROVIDER` | `stub` or `alpha_hunter`. No silent fallback occurs. |
 | `AHX_BRIDGE_URL` | Read-only bridge URL. |
@@ -162,8 +166,12 @@ default or fallback: activating `x402-mainnet` requires all of:
 - explicit HTTPS public API URL and CORS origins; and
 - an HTTPS facilitator.
 
-The included browser client remains Testnet-only. No Mainnet client, deployment,
-payment, or settlement test is provided or performed by this repository.
+The repository includes an isolated Algorand Mainnet browser client in
+[`integration-client-mainnet/`](integration-client-mainnet/README.md).
+A single authorized paid Mainnet end-to-end test completed on 2026-09-24;
+see [the Mainnet evidence record](docs/public-mainnet-e2e-proof.md).
+The test response was **STALE**, not evidence of fresh data, customer demand,
+or ongoing public uptime. No independent customer payment is documented.
 
 ## Disclaimer
 
