@@ -160,6 +160,34 @@ def create_app(
                     "mint": "So11111111111111111111111111111111111111112",
                 },
             },
+            "resources": [
+                {
+                    "method": "POST",
+                    "path": "/v1/token/investigate",
+                    "name": "Solana creator and wallet behavioral intelligence",
+                    "description": (
+                        "Investigate token creator behavior, wallet activity, "
+                        "concentration, historical behavioral findings and "
+                        "traceable evidence for AI trading agents. "
+                        "Returns explicit data-quality and freshness status. "
+                        "Does not execute trades."
+                    ),
+                    "price_usd": str(settings.price_usd),
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "chain": {"type": "string", "const": "solana"},
+                            "mint": {
+                                "type": "string",
+                                "minLength": 32,
+                                "maxLength": 44,
+                            },
+                        },
+                        "required": ["chain", "mint"],
+                        "additionalProperties": False,
+                    },
+                }
+            ],
             "payment": {
                 "protocol": "x402",
                 "mode": settings.payment_mode,
