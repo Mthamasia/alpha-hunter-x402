@@ -40,25 +40,79 @@ def _rid(request: Request) -> str | None:
     return getattr(request.state, "request_id", None)
 
 
-def _billable_intelligence(result: Any) -> bool:
-    """A Mainnet sale requires observed, current, substantive evidence.
+# Only independently traceable on-chain references qualify as paid
+# evidence; a source label such as {"source": "bridge"} is not a reference.
+_TRACE_KEYS = (
+    "transaction_signature", "tx_signature", "signature",
+    "transaction_id", "tx_hash", "tx_id", "event_id", "reference", "url",
+)
 
-    This is a sale-eligibility check, not a live-data collection trigger.
-    Historical or empty reports remain available in internal modes.
+
+def _traceable_evidence(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    for key in _TRACE_KEYS:
+        value = item.get(key)
+        if isinstance(value, str) and value.strip() and value.strip().upper() != "UNKNOWN":
+            return True
+    # A recorded Solana slot is independently locatable, even without a
+    # transaction ID, but bool and zero are not valid observed slots.
+    slot = item.get("slot")
+    return isinstance(slot, int) and not isinstance(slot, bool) and slot > 0
+
+
+def _substantive_finding(intelligence: Any) -> bool:
+    # A known creator address alone or a guessed trust score is not a
+    # behavioral finding. Demand observed outcomes rather than a profile stub.
+    creator = getattr(intelligence, "creator", None)
+    if isinstance(creator, dict):
+        profile = creator.get("profile")
+        if isinstance(profile, dict):
+            for field in ("verified_launches", "confirmed_outcomes", "observed_launches"):
+                n = profile.get(field)
+                if type(n) is int and n > 0:
+                    return True
+
+    wallet = getattr(intelligence, "wallet_activity", None)
+    if isinstance(wallet, dict):
+        profile = wallet.get("profile")
+        if isinstance(profile, dict):
+            count = profile.get("total_events")
+            if type(count) is int and count > 0:
+                return True
+        events = wallet.get("recent_events")
+        if isinstance(events, list) and any(isinstance(item, dict) and item for item in events):
+            return True
+
+    findings = getattr(intelligence, "behavioral_findings", None)
+    if isinstance(findings, dict):
+        alerts = findings.get("alerts")
+        if isinstance(alerts, list) and any(isinstance(item, dict) and item for item in alerts):
+            return True
+        explanation = findings.get("explanation")
+        if isinstance(explanation, str) and len(explanation.strip()) >= 30:
+            return True
+    return False
+
+
+def _billable_intelligence(result: Any) -> bool:
+    """Mainnet settlement requires fresh, traceable, substantive evidence.
+
+    An empty dict, source-only label, creator address, or unexplained score
+    must NEVER be enough to accept payment. This is a sale eligibility guard,
+    not a trigger for fetching more data or consuming Helius credits.
     """
     quality = getattr(getattr(result, "data_quality", None), "status", None)
     if quality != "FRESH":
         return False
 
     intelligence = getattr(result, "intelligence", None)
-    if intelligence is None or not getattr(intelligence, "evidence", None):
+    if intelligence is None:
         return False
-
-    # One evidence item plus at least one meaningful intelligence finding.
-    for attr in ("creator", "wallet_activity", "concentration", "behavioral_findings"):
-        if getattr(intelligence, attr, None):
-            return True
-    return False
+    evidence = getattr(intelligence, "evidence", None)
+    if not isinstance(evidence, list) or not any(_traceable_evidence(i) for i in evidence):
+        return False
+    return _substantive_finding(intelligence)
 
 
 def create_app(
