@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+import math
 from urllib.parse import quote
 
 import httpx
@@ -10,6 +11,36 @@ from app.models import DataQuality, Intelligence
 from app.providers.base import IntelligenceProvider, ProviderResult
 
 BRIDGE_SCHEMA_VERSION = "1.0"
+
+
+
+def _verified_freshness_status(claimed: str, freshness: dict[str, Any]) -> tuple[str, str | None]:
+    """Never elevate a contradictory bridge freshness claim to FRESH.
+
+    This is a consistency gate, not independent time verification. The
+    provider is still the source of age_seconds; a separate timestamp
+    chronology gate is required before asserting independent freshness.
+    """
+    if claimed != "FRESH":
+        return claimed, None
+
+    stale = freshness.get("is_stale")
+    age = freshness.get("age_seconds")
+    ttl = freshness.get("stale_after_seconds")
+    if stale is True:
+        return "STALE", "Bridge freshness flag contradicts FRESH."
+    if stale is not False:
+        return "UNAVAILABLE", "Bridge freshness flag is missing or invalid."
+
+    # bool is a subclass of int but is not a legitimate duration.
+    def valid_number(value: Any) -> bool:
+        return type(value) in (int, float) and math.isfinite(value)
+
+    if not valid_number(age) or not valid_number(ttl) or age < 0 or ttl <= 0:
+        return "UNAVAILABLE", "Bridge freshness age or threshold is invalid."
+    if age >= ttl:
+        return "STALE", "Bridge freshness age exceeds the allowed threshold."
+    return "FRESH", None
 
 
 class ProviderError(RuntimeError):
@@ -120,6 +151,12 @@ class AlphaHunterProvider(IntelligenceProvider):
         ):
             raise ProviderError()
 
+        freshness_status, freshness_warning = _verified_freshness_status(
+            freshness_status, freshness
+        )
+        if freshness_warning:
+            limitations = [*limitations, freshness_warning]
+
         # These fields are structured objects in the real AHX bridge
         # contract. Evidence remains a list.
         creator = payload.get("creator")
@@ -150,8 +187,8 @@ class AlphaHunterProvider(IntelligenceProvider):
             bridge_status = freshness_status
 
         public_status = (
-            "STALE"
-            if freshness_status == "STALE"
+            freshness_status
+            if freshness_warning or freshness_status == "STALE"
             else bridge_status
         )
 
