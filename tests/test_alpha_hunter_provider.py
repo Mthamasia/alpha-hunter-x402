@@ -6,7 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.config import ConfigError, Settings
-from app.main import create_app
+from app.main import _billable_intelligence, create_app
 from app.providers import AlphaHunterProvider, StubIntelligenceProvider
 from tests.conftest import WSOL_MINT
 
@@ -478,3 +478,51 @@ def test_alpha_hunter_configuration_requires_service_token():
         Settings(
             intelligence_provider="alpha_hunter"
         )
+
+# Payment-eligibility safety check against inconsistent bridge freshness.
+# Only in-memory payloads; these tests do not invoke Helius, x402, or HTTP.
+@pytest.mark.parametrize(
+    ("freshness", "expected_status"),
+    [
+        ({"is_stale": True, "age_seconds": 2, "stale_after_seconds": 60}, "STALE"),
+        ({"is_stale": False, "age_seconds": 60, "stale_after_seconds": 60}, "STALE"),
+        ({"is_stale": False, "age_seconds": 61, "stale_after_seconds": 60}, "STALE"),
+        ({"is_stale": None, "age_seconds": 2, "stale_after_seconds": 60}, "UNAVAILABLE"),
+        ({"is_stale": False, "age_seconds": -1, "stale_after_seconds": 60}, "UNAVAILABLE"),
+        ({"is_stale": False, "age_seconds": 0, "stale_after_seconds": 0}, "UNAVAILABLE"),
+        ({"is_stale": False, "age_seconds": True, "stale_after_seconds": 60}, "UNAVAILABLE"),
+        ({"is_stale": False, "age_seconds": 2, "stale_after_seconds": False}, "UNAVAILABLE"),
+        ({"is_stale": False, "age_seconds": float("nan"), "stale_after_seconds": 60}, "UNAVAILABLE"),
+        ({"is_stale": False, "age_seconds": 2, "stale_after_seconds": float("inf")}, "UNAVAILABLE"),
+        ({}, "UNAVAILABLE"),
+    ],
+)
+def test_false_fresh_cannot_be_billed(freshness, expected_status):
+    payload = bridge_payload(
+        freshness=freshness,
+        creator={"profile": {"verified_launches": 2}},
+        evidence=[{"transaction_signature": "3kJmTxProof"}],
+        data_quality={"status": "FRESH", "limitations": []},
+    )
+    result = AlphaHunterProvider._map_response(payload, WSOL_MINT)
+    assert result.data_quality.status == expected_status
+    assert result.status == expected_status
+    assert result.data_quality.limitations
+    assert not _billable_intelligence(result)
+
+
+def test_consistent_freshness_with_traceable_behavior_remains_eligible():
+    payload = bridge_payload(
+        freshness={
+            "is_stale": False,
+            "age_seconds": 10,
+            "stale_after_seconds": 60,
+        },
+        creator={"profile": {"verified_launches": 2}},
+        evidence=[{"transaction_signature": "3kJmTxProof"}],
+        data_quality={"status": "FRESH", "limitations": []},
+    )
+    result = AlphaHunterProvider._map_response(payload, WSOL_MINT)
+    assert result.data_quality.status == "FRESH"
+    assert result.status == "FRESH"
+    assert _billable_intelligence(result)
