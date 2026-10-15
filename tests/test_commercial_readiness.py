@@ -481,3 +481,75 @@ def test_reference_bridge_old_snapshot_is_not_sellable(monkeypatch):
     assert r.status_code == 503
     assert "evidence_older_than_freshness_window" in r.json()["error"]["reasons"]
     assert fac.settle_calls == 0
+
+
+# ------------------------------------------------------------ persistence / concurrency / storage failure
+def _paths(tmp_path):
+    return dict(telemetry_db_path=str(tmp_path / "telemetry.db"), quota_db_path=str(tmp_path / "quota.db"))
+
+
+def test_books_survive_restart_and_replay_stays_blocked(monkeypatch, tmp_path):
+    bridge = lambda _u: httpx.Response(200, json=good_payload())
+    client, fac, _ = build(monkeypatch, bridge, **_paths(tmp_path))
+    req = get_requirements(client).accepts[0]
+    proof = unique_proof(req, nonce="restart")
+    assert paid(client, proof=proof).status_code == 200
+
+    # "restart": a brand-new app process on the same volume files
+    client2, fac2, calls2 = build(monkeypatch, bridge, **_paths(tmp_path))
+    assert paid(client2, proof=proof).status_code == 409
+    assert fac2.settle_calls == 0 and calls2["bridge"] == 0
+    totals = client2.app.state.cost_ledger.totals_all()
+    assert totals["revenue_usd_total"] == "0.05"
+
+
+def test_preview_quota_survives_restart(monkeypatch, tmp_path):
+    bridge = lambda _u: httpx.Response(200, json=good_payload())
+    client, _, _ = build(monkeypatch, bridge, quota_anonymous_per_day=2, **_paths(tmp_path))
+    for _ in range(2):
+        assert client.post(PREVIEW, json={"chain": "solana", "mint": WSOL_MINT}).status_code == 200
+    client2, _, _ = build(monkeypatch, bridge, quota_anonymous_per_day=2, **_paths(tmp_path))
+    assert client2.post(PREVIEW, json={"chain": "solana", "mint": WSOL_MINT}).status_code == 429
+
+
+def test_concurrent_same_proof_claimed_exactly_once(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from app.payments.replay import PaymentReplayGuard
+
+    guard = PaymentReplayGuard(str(tmp_path / "quota.db"))
+    with ThreadPoolExecutor(16) as pool:
+        results = list(pool.map(lambda i: guard.try_acquire("same-digest", f"r{i}"), range(64)))
+    assert results.count(True) == 1
+
+
+def test_concurrent_preview_never_exceeds_quota(monkeypatch, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    client, _, _ = build(monkeypatch, lambda _u: httpx.Response(200, json=good_payload()),
+                         quota_anonymous_per_minute=5, quota_anonymous_per_day=50, **_paths(tmp_path))
+    with ThreadPoolExecutor(8) as pool:
+        codes = list(pool.map(
+            lambda _i: client.post(PREVIEW, json={"chain": "solana", "mint": WSOL_MINT}).status_code, range(20)))
+    assert codes.count(200) == 5
+    assert codes.count(429) == 15
+
+
+def test_unwritable_storage_fails_closed(monkeypatch, tmp_path):
+    bridge = lambda _u: httpx.Response(200, json=good_payload())
+    client, fac, calls = build(monkeypatch, bridge, **_paths(tmp_path))
+    # Storage disappears after startup (volume detached / disk error).
+    import sqlite3
+
+    def broken(*_a, **_k):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(client.app.state.replay_guard, "try_acquire", broken)
+    r = paid(client)
+    assert r.status_code == 503
+    assert r.json()["error"]["code"] == "payment_unavailable"
+    assert fac.settle_calls == 0 and calls["bridge"] == 0
+
+    monkeypatch.setattr(client.app.state.quota_store, "_connect", broken)
+    p = client.post(PREVIEW, json={"chain": "solana", "mint": WSOL_MINT})
+    assert p.status_code == 429  # quota store unavailable -> denied, not unlimited
