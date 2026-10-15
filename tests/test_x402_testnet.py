@@ -355,8 +355,8 @@ def test_mainnet_settles_once_for_fresh_substantive_report():
     fac = FakeFacilitator(network=ALGORAND_MAINNET_CAIP2)
     provider = FixedProvider(
         "FRESH",
-        [{"source": "on-chain"}],
-        {"address": "creator"},
+        [{"source": "on-chain", "transaction_signature": "3kJmTxProof"}],
+        {"address": "creator", "profile": {"verified_launches": 2}},
     )
     client = TestClient(
         create_app(
