@@ -59,6 +59,7 @@ def block_network(monkeypatch):
 
 
 def make_client(**overrides) -> TestClient:
+    overrides.setdefault("premium_sales_enabled", True)
     return TestClient(create_app(Settings(**overrides)), raise_server_exceptions=False)
 
 

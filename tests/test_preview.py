@@ -50,6 +50,7 @@ def make_app(monkeypatch, handler, **settings_overrides):
         payment_mode="disabled",
         intelligence_provider="alpha_hunter",
         ahx_bridge_service_token=SERVICE_TOKEN,
+        premium_sales_enabled=True,
     )
     defaults.update(settings_overrides)
     settings = Settings(**defaults)

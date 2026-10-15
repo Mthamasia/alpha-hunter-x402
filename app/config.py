@@ -99,6 +99,12 @@ class Settings:
     paid_evidence_max_age_seconds: int = 86400
     # Market caps above this (USD) are treated as anomalous and removed.
     max_marketcap_usd: float = 1e11
+    # Premium sales switch. FAIL-CLOSED: anything but an explicit
+    # PREMIUM_SALES_ENABLED=true keeps POST /v1/token/investigate in
+    # maintenance (blocked before payment verification, settlement or any
+    # provider call). Unlike PAYMENT_MODE=disabled, maintenance never
+    # serves premium intelligence for free.
+    premium_sales_enabled: bool = False
 
     def __post_init__(self) -> None:
         if self.app_env not in APP_ENVS:
@@ -386,4 +392,5 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         quota_registered_distinct_mints_per_day=_int_or_none("QUOTA_REGISTERED_DISTINCT_MINTS_PER_DAY") or 60,
         paid_evidence_max_age_seconds=_int_or_none("PAID_EVIDENCE_MAX_AGE_SECONDS") or 86400,
         max_marketcap_usd=_float_env("MAX_MARKETCAP_USD", 1e11),
+        premium_sales_enabled=os.getenv("PREMIUM_SALES_ENABLED", "").strip().lower() == "true",
     )

@@ -59,6 +59,7 @@ same mint within 60 s are served from cache and never reach the bridge.
 
 | code | meaning |
 |---|---|
+| `premium_sales_maintenance` | sales are suspended by the operator; `/v1/token/investigate` returns 503 `premium_maintenance` with no offer and no charge |
 | `data_not_fresh` | the bridge does not classify the data as FRESH (or it is inconsistent) |
 | `no_verifiable_transaction_evidence` | no evidence item has a valid Solana tx signature / explorer URL |
 | `evidence_not_linked_to_requested_mint` | evidence exists but is not explicitly about this mint |

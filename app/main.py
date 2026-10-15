@@ -69,6 +69,7 @@ MAX_AGENT_ID_LEN = 128
 # from app.payments.gate.PAYMENT_RESPONSE_HEADER ("X-PAYMENT-RESPONSE"),
 # which only exists for this project's own simulated `test` mode.
 X402_SETTLEMENT_HEADER = "PAYMENT-RESPONSE"
+PREMIUM_PATH = "/v1/token/investigate"
 
 logger = logging.getLogger("ahx")
 
@@ -323,6 +324,23 @@ def create_app(
                     except Exception:
                         logger.critical("payment replay store update failed rid=%s", _rid(request), exc_info=True)
 
+    # Registered after x402_payment and before request_context: Starlette
+    # runs it OUTSIDE the x402 layer (so nothing is verified, offered or
+    # settled) and INSIDE request_context (so the response has an id).
+    @app.middleware("http")
+    async def premium_maintenance(request: Request, call_next):
+        if not settings.premium_sales_enabled and request.url.path == PREMIUM_PATH:
+            response = _error(
+                503,
+                "premium_maintenance",
+                "Premium investigation is temporarily unavailable. No payment was "
+                "requested, verified or settled, and no intelligence was produced.",
+                _rid(request),
+            )
+            response.headers["Retry-After"] = "3600"
+            return response
+        return await call_next(request)
+
     @app.middleware("http")
     async def request_context(request: Request, call_next):
         # request_id sempre gerado no servidor (não confiamos em IDs do cliente).
@@ -486,6 +504,7 @@ def create_app(
                         "Does not execute trades."
                     ),
                     "price_usd": str(settings.price_usd),
+                    "sales_status": "available" if settings.premium_sales_enabled else "maintenance",
                     "payment": {"required": True, "protocol": "x402"},
                     "input_schema": {
                         "type": "object",
@@ -508,6 +527,7 @@ def create_app(
                 "negotiation": "Make an unsigned POST to receive the PAYMENT-REQUIRED offer when x402 is enabled.",
             },
             "data_quality": "Check status and data_quality in every paid response.",
+            "sales_status": "available" if settings.premium_sales_enabled else "maintenance",
         }
 
     @app.get("/health")
@@ -530,6 +550,7 @@ def create_app(
             # Deployed commit (Railway injects RAILWAY_GIT_COMMIT_SHA). Lets
             # an operator prove which code is live; None when not provided.
             "commit": (os.getenv("RAILWAY_GIT_COMMIT_SHA") or os.getenv("GIT_COMMIT_SHA") or "")[:12] or None,
+            "premium_sales": "available" if settings.premium_sales_enabled else "maintenance",
         }
 
     def _revenue_for_investigate(billed: bool) -> tuple[Decimal | None, str]:
@@ -706,8 +727,12 @@ def create_app(
             age_seconds=result.age_seconds,
             is_stale=result.is_stale,
             data_quality=result.data_quality,
-            premium_eligible=eligibility.eligible,
-            premium_ineligibility_reasons=eligibility.reasons,
+            premium_eligible=eligibility.eligible and settings.premium_sales_enabled,
+            premium_ineligibility_reasons=(
+                eligibility.reasons
+                if settings.premium_sales_enabled
+                else ["premium_sales_maintenance", *eligibility.reasons]
+            ),
         )
         return JSONResponse(content=payload.model_dump(mode="json"))
 

@@ -85,6 +85,7 @@ class FakeFacilitator:
 
 def x402_settings(**overrides) -> Settings:
     base = dict(payment_mode="x402-testnet", pay_to=RECEIVER, x402_facilitator_url=FACILITATOR)
+    base.setdefault("premium_sales_enabled", True)
     base.update(overrides)
     return Settings(**base)
 
@@ -111,6 +112,7 @@ def mainnet_x402_settings(**overrides) -> Settings:
         telemetry_db_path=str(_tmpdir() / "telemetry.db"),
         quota_db_path=str(_tmpdir() / "quota.db"),
     )
+    base.setdefault("premium_sales_enabled", True)
     base.update(overrides)
     return Settings(**base)
 
