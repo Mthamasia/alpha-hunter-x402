@@ -9,6 +9,7 @@ from app.config import ConfigError, Settings
 from app.main import _billable_intelligence, create_app
 from app.providers import AlphaHunterProvider, StubIntelligenceProvider
 from tests.conftest import WSOL_MINT
+from tests.evidence_helpers import tx_evidence
 
 URL = "/v1/token/investigate"
 SERVICE_TOKEN = "test-service-token-must-not-leak"
@@ -160,11 +161,12 @@ def test_alpha_hunter_maps_valid_bridge_response(monkeypatch):
 
     assert body["status"] == "FRESH"
 
+    # A trust score with no observed launch outcomes is not reputation:
+    # the public response reports UNKNOWN and says why.
     assert body["intelligence"]["creator"] == {
         "address": "creator-address",
-        "profile": {
-            "trust_score": 100.0,
-        },
+        "profile": {},
+        "reputation": "UNKNOWN",
     }
 
     assert body["intelligence"]["wallet_activity"]["market"][
@@ -190,6 +192,7 @@ def test_alpha_hunter_maps_valid_bridge_response(monkeypatch):
         "status": "FRESH",
         "limitations": [
             "Bridge is read-only.",
+            "Creator reputation reported as UNKNOWN: no observed launch outcomes support a score.",
         ],
     }
 
@@ -244,6 +247,7 @@ def test_alpha_hunter_preserves_null_concentration_empty_evidence_and_stale(
 
     assert body["data_quality"]["limitations"] == [
         "Dados de mercado antigos: STALE.",
+        "Creator reputation reported as UNKNOWN: no observed launch outcomes support a score.",
     ]
 
 
@@ -501,14 +505,14 @@ def test_false_fresh_cannot_be_billed(freshness, expected_status):
     payload = bridge_payload(
         freshness=freshness,
         creator={"profile": {"verified_launches": 2}},
-        evidence=[{"transaction_signature": "3kJmTxProof"}],
+        evidence=[tx_evidence(WSOL_MINT)],
         data_quality={"status": "FRESH", "limitations": []},
     )
     result = AlphaHunterProvider._map_response(payload, WSOL_MINT)
     assert result.data_quality.status == expected_status
     assert result.status == expected_status
     assert result.data_quality.limitations
-    assert not _billable_intelligence(result)
+    assert not _billable_intelligence(result, WSOL_MINT, max_evidence_age_seconds=86400)
 
 
 def test_consistent_freshness_with_traceable_behavior_remains_eligible():
@@ -519,10 +523,10 @@ def test_consistent_freshness_with_traceable_behavior_remains_eligible():
             "stale_after_seconds": 60,
         },
         creator={"profile": {"verified_launches": 2}},
-        evidence=[{"transaction_signature": "3kJmTxProof"}],
+        evidence=[tx_evidence(WSOL_MINT)],
         data_quality={"status": "FRESH", "limitations": []},
     )
     result = AlphaHunterProvider._map_response(payload, WSOL_MINT)
     assert result.data_quality.status == "FRESH"
     assert result.status == "FRESH"
-    assert _billable_intelligence(result)
+    assert _billable_intelligence(result, WSOL_MINT, max_evidence_age_seconds=86400)

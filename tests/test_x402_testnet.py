@@ -31,6 +31,7 @@ from app.config import ConfigError, Settings
 from app.main import create_app
 from app.payments.x402_avm import build_facilitator_client
 from tests.conftest import NetworkBlocked, WSOL_MINT
+from tests.evidence_helpers import tx_evidence
 
 URL = "/v1/token/investigate"
 REQ = {"chain": "solana", "mint": WSOL_MINT}
@@ -457,7 +458,7 @@ def test_mainnet_settles_once_for_fresh_substantive_report():
     fac = FakeFacilitator(network=ALGORAND_MAINNET_CAIP2)
     provider = FixedProvider(
         "FRESH",
-        [{"source": "on-chain", "transaction_signature": "3kJmTxProof"}],
+        [tx_evidence(WSOL_MINT, source="on-chain")],
         {"address": "creator", "profile": {"verified_launches": 2}},
     )
     client = TestClient(

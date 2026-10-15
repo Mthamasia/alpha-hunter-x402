@@ -199,6 +199,10 @@ class AlphaHunterProvider(IntelligenceProvider):
         is_stale = freshness.get("is_stale")
         if not isinstance(is_stale, bool):
             is_stale = None
+        if freshness_status == "STALE":
+            # A FRESH claim downgraded by the consistency gate must not
+            # still be reported to buyers as not-stale.
+            is_stale = True
 
         return ProviderResult(
             status=public_status,

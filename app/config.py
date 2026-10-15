@@ -93,6 +93,12 @@ class Settings:
     quota_registered_per_minute: int = 30
     quota_registered_per_day: int = 300
     quota_registered_distinct_mints_per_day: int = 60
+    # Independent chronology gate (app/quality.py): the newest mint-linked,
+    # verifiable on-chain evidence must be at most this old, measured
+    # against this server's clock -- not the bridge's own age claim.
+    paid_evidence_max_age_seconds: int = 86400
+    # Market caps above this (USD) are treated as anomalous and removed.
+    max_marketcap_usd: float = 1e11
 
     def __post_init__(self) -> None:
         if self.app_env not in APP_ENVS:
@@ -124,9 +130,12 @@ class Settings:
             "quota_anonymous_per_minute", "quota_anonymous_per_day", "quota_anonymous_distinct_mints_per_day",
             "quota_registered_per_minute", "quota_registered_per_day", "quota_registered_distinct_mints_per_day",
             "telemetry_retention_days", "retention_purge_interval_seconds",
+            "paid_evidence_max_age_seconds",
         ):
             if getattr(self, name) <= 0:
                 raise ConfigError(f"{name.upper()} deve ser maior que zero.")
+        if not math.isfinite(self.max_marketcap_usd) or self.max_marketcap_usd <= 0:
+            raise ConfigError("MAX_MARKETCAP_USD deve ser maior que zero.")
         if self.trusted_proxy_header and not self.trusted_proxy_cidrs:
             raise ConfigError(
                 "TRUSTED_PROXY_HEADER exige TRUSTED_PROXY_CIDRS: um nome de header configurado, "
@@ -296,6 +305,15 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         except ValueError as exc:
             raise ConfigError(f"{name} deve ser um inteiro.") from exc
 
+    def _float_env(name: str, default: float) -> float:
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            return default
+        try:
+            return float(raw)
+        except ValueError as exc:
+            raise ConfigError(f"{name} deve ser numérico.") from exc
+
     try:
         preview_ttl = float(
             os.getenv("PREVIEW_CACHE_TTL_SECONDS", str(DEFAULT_PREVIEW_CACHE_TTL_SECONDS)).strip()
@@ -359,4 +377,6 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         quota_registered_per_minute=_int_or_none("QUOTA_REGISTERED_PER_MINUTE") or 30,
         quota_registered_per_day=_int_or_none("QUOTA_REGISTERED_PER_DAY") or 300,
         quota_registered_distinct_mints_per_day=_int_or_none("QUOTA_REGISTERED_DISTINCT_MINTS_PER_DAY") or 60,
+        paid_evidence_max_age_seconds=_int_or_none("PAID_EVIDENCE_MAX_AGE_SECONDS") or 86400,
+        max_marketcap_usd=_float_env("MAX_MARKETCAP_USD", 1e11),
     )

@@ -126,3 +126,7 @@ class PreviewResponse(BaseModel):
     age_seconds: int | None = None
     is_stale: bool | None = None
     data_quality: DataQuality
+    # Would POST /v1/token/investigate currently return chargeable
+    # intelligence? Same gate as Mainnet settlement (app/quality.py).
+    premium_eligible: bool = False
+    premium_ineligibility_reasons: list[str] = Field(default_factory=list)

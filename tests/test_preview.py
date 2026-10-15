@@ -67,6 +67,7 @@ def test_preview_valid_mint_returns_limited_summary_without_premium_fields(monke
     assert set(body) == {
         "schema_version", "request_id", "chain", "mint", "generated_at",
         "available", "status", "age_seconds", "is_stale", "data_quality",
+        "premium_eligible", "premium_ineligibility_reasons",
     }
     assert body["available"] is True
     assert body["status"] == "FRESH"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import logging
+import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -17,7 +18,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app import SCHEMA_VERSION, __version__
 from app.config import Settings, load_settings
-from app.models import InvestigateRequest, InvestigateResponse, PreviewResponse
+from app.models import DataQuality, InvestigateRequest, InvestigateResponse, PreviewResponse
 from app.payments.gate import (
     PAYMENT_HEADER,
     PAYMENT_RESPONSE_HEADER,
@@ -37,6 +38,7 @@ from app.quota import (
     hash_identifier,
     hash_key,
 )
+from app.quality import assess_premium_eligibility, sanitize_intelligence
 from app.ratelimit import TTLCache
 from app.telemetry import (
     REVENUE_FAILED,
@@ -142,79 +144,19 @@ def _resolve_subject_and_tier(
     return f"ip:{hash_identifier(ip, settings.quota_ip_pseudonymization_salt)}", TIER_ANONYMOUS
 
 
-# Only independently traceable on-chain references qualify as paid
-# evidence; a source label such as {"source": "bridge"} is not a reference.
-_TRACE_KEYS = (
-    "transaction_signature", "tx_signature", "signature",
-    "transaction_id", "tx_hash", "tx_id", "event_id", "reference", "url",
-)
-
-
-def _traceable_evidence(item: Any) -> bool:
-    if not isinstance(item, dict):
-        return False
-    for key in _TRACE_KEYS:
-        value = item.get(key)
-        if isinstance(value, str) and value.strip() and value.strip().upper() != "UNKNOWN":
-            return True
-    # A recorded Solana slot is independently locatable, even without a
-    # transaction ID, but bool and zero are not valid observed slots.
-    slot = item.get("slot")
-    return isinstance(slot, int) and not isinstance(slot, bool) and slot > 0
-
-
-def _substantive_finding(intelligence: Any) -> bool:
-    # A known creator address alone or a guessed trust score is not a
-    # behavioral finding. Demand observed outcomes rather than a profile stub.
-    creator = getattr(intelligence, "creator", None)
-    if isinstance(creator, dict):
-        profile = creator.get("profile")
-        if isinstance(profile, dict):
-            for field in ("verified_launches", "confirmed_outcomes", "observed_launches"):
-                n = profile.get(field)
-                if type(n) is int and n > 0:
-                    return True
-
-    wallet = getattr(intelligence, "wallet_activity", None)
-    if isinstance(wallet, dict):
-        profile = wallet.get("profile")
-        if isinstance(profile, dict):
-            count = profile.get("total_events")
-            if type(count) is int and count > 0:
-                return True
-        events = wallet.get("recent_events")
-        if isinstance(events, list) and any(isinstance(item, dict) and item for item in events):
-            return True
-
-    findings = getattr(intelligence, "behavioral_findings", None)
-    if isinstance(findings, dict):
-        alerts = findings.get("alerts")
-        if isinstance(alerts, list) and any(isinstance(item, dict) and item for item in alerts):
-            return True
-        explanation = findings.get("explanation")
-        if isinstance(explanation, str) and len(explanation.strip()) >= 30:
-            return True
-    return False
-
-
-def _billable_intelligence(result: Any) -> bool:
-    """Mainnet settlement requires fresh, traceable, substantive evidence.
-
-    An empty dict, source-only label, creator address, or unexplained score
-    must NEVER be enough to accept payment. This is a sale eligibility guard,
-    not a trigger for fetching more data or consuming Helius credits.
-    """
-    quality = getattr(getattr(result, "data_quality", None), "status", None)
-    if quality != "FRESH":
-        return False
-
-    intelligence = getattr(result, "intelligence", None)
-    if intelligence is None:
-        return False
-    evidence = getattr(intelligence, "evidence", None)
-    if not isinstance(evidence, list) or not any(_traceable_evidence(i) for i in evidence):
-        return False
-    return _substantive_finding(intelligence)
+def _billable_intelligence(
+    result: Any,
+    mint: str,
+    *,
+    max_evidence_age_seconds: int,
+    now: datetime | None = None,
+) -> bool:
+    """Mainnet settlement requires fresh, verifiable, mint-linked, recent,
+    substantive evidence. See app/quality.py. This is a sale-eligibility
+    guard, never a trigger for fetching more data or consuming Helius."""
+    return assess_premium_eligibility(
+        result, mint, now=now, max_evidence_age_seconds=max_evidence_age_seconds
+    ).eligible
 
 
 def create_app(
@@ -530,6 +472,9 @@ def create_app(
             "app_env": settings.app_env,
             "payment_mode": settings.payment_mode,
             "provider": provider.name,
+            # Deployed commit (Railway injects RAILWAY_GIT_COMMIT_SHA). Lets
+            # an operator prove which code is live; None when not provided.
+            "commit": (os.getenv("RAILWAY_GIT_COMMIT_SHA") or os.getenv("GIT_COMMIT_SHA") or "")[:12] or None,
         }
 
     def _revenue_for_investigate(billed: bool) -> tuple[Decimal | None, str]:
@@ -556,7 +501,10 @@ def create_app(
         decision = gate.verify(request.headers.get(PAYMENT_HEADER), str(request.url.path))
         tracker = HeliusCallTracker()
         result = provider.investigate(body.chain, body.mint)
-        billed = settings.payment_mode != "x402-mainnet" or _billable_intelligence(result)
+        eligibility = assess_premium_eligibility(
+            result, body.mint, max_evidence_age_seconds=settings.paid_evidence_max_age_seconds
+        )
+        billed = settings.payment_mode != "x402-mainnet" or eligibility.eligible
         if settings.payment_mode == "x402-mainnet" and not billed:
             # x402 settles only successful endpoint responses: do not charge
             # for missing, old, or unsubstantiated intelligence.
@@ -579,6 +527,7 @@ def create_app(
                 "intelligence_not_ready",
                 "Current evidence is not available for this token; no payment settled.",
                 _rid(request),
+                reasons=eligibility.reasons,
             )
         revenue_usd, revenue_kind = _revenue_for_investigate(billed)
         record_query(
@@ -594,14 +543,20 @@ def create_app(
             revenue_kind=revenue_kind,
             credit_cost_usd=settings.helius_credit_cost_usd,
         )
+        public_intelligence, quality_notes = sanitize_intelligence(
+            result.intelligence, max_marketcap_usd=settings.max_marketcap_usd
+        )
         payload = InvestigateResponse(
             request_id=request.state.request_id,
             chain=body.chain,
             mint=body.mint,
             status=result.status,
             generated_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            intelligence=result.intelligence,
-            data_quality=result.data_quality,
+            intelligence=public_intelligence,
+            data_quality=DataQuality(
+                status=result.data_quality.status,
+                limitations=[*result.data_quality.limitations, *quality_notes],
+            ),
         )
         response = JSONResponse(content=payload.model_dump(mode="json"))
         if decision.response_header:
@@ -678,6 +633,12 @@ def create_app(
         )
 
         available = result.status not in ("NO_DATA", "NO_DATA_SOURCE")
+        # Same gate the paid route applies before settlement, so an agent can
+        # decide for free whether paying would return chargeable intelligence.
+        # Only stable reason codes are exposed, never the premium payload.
+        eligibility = assess_premium_eligibility(
+            result, body.mint, max_evidence_age_seconds=settings.paid_evidence_max_age_seconds
+        )
         payload = PreviewResponse(
             request_id=request.state.request_id,
             chain=body.chain,
@@ -688,6 +649,8 @@ def create_app(
             age_seconds=result.age_seconds,
             is_stale=result.is_stale,
             data_quality=result.data_quality,
+            premium_eligible=eligibility.eligible,
+            premium_ineligibility_reasons=eligibility.reasons,
         )
         return JSONResponse(content=payload.model_dump(mode="json"))
 
