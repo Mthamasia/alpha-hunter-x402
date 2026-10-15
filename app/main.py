@@ -27,6 +27,7 @@ from app.providers import (
 )
 
 MAX_BODY_BYTES = 4096
+PREMIUM_PATH = "/v1/token/investigate"
 
 logger = logging.getLogger("ahx")
 
@@ -100,6 +101,23 @@ def create_app(
                 logger.exception("x402 payment layer error rid=%s", _rid(request))
                 return _error(503, "payment_unavailable",
                               "payment facilitator unavailable", _rid(request))
+
+    # Registered after x402_payment and before request_context: Starlette
+    # runs it OUTSIDE the x402 layer (so nothing is verified, offered or
+    # settled) and INSIDE request_context (so the response has an id).
+    @app.middleware("http")
+    async def premium_maintenance(request: Request, call_next):
+        if not settings.premium_sales_enabled and request.url.path == PREMIUM_PATH:
+            response = _error(
+                503,
+                "premium_maintenance",
+                "Premium investigation is temporarily unavailable. No payment was "
+                "requested, verified or settled, and no intelligence was produced.",
+                _rid(request),
+            )
+            response.headers["Retry-After"] = "3600"
+            return response
+        return await call_next(request)
 
     @app.middleware("http")
     async def request_context(request: Request, call_next):
@@ -194,6 +212,7 @@ def create_app(
                         "Does not execute trades."
                     ),
                     "price_usd": str(settings.price_usd),
+                    "sales_status": "available" if settings.premium_sales_enabled else "maintenance",
                     "input_schema": {
                         "type": "object",
                         "properties": {
@@ -215,6 +234,7 @@ def create_app(
                 "negotiation": "Make an unsigned POST to receive the PAYMENT-REQUIRED offer when x402 is enabled.",
             },
             "data_quality": "Check status and data_quality in every paid response.",
+            "sales_status": "available" if settings.premium_sales_enabled else "maintenance",
         }
 
     @app.get("/health")
@@ -234,6 +254,7 @@ def create_app(
             "app_env": settings.app_env,
             "payment_mode": settings.payment_mode,
             "provider": provider.name,
+            "premium_sales": "available" if settings.premium_sales_enabled else "maintenance",
         }
 
     @app.post("/v1/token/investigate", response_model=InvestigateResponse)

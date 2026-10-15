@@ -44,6 +44,12 @@ class Settings:
     public_base_url: str = ""
     cors_allow_origins: tuple[str, ...] = ()
     enable_mainnet_x402: bool = False
+    # Premium sales switch. FAIL-CLOSED: anything but an explicit
+    # PREMIUM_SALES_ENABLED=true keeps POST /v1/token/investigate in
+    # maintenance (blocked before payment verification, settlement or any
+    # provider call). Unlike PAYMENT_MODE=disabled, maintenance never
+    # serves premium intelligence for free.
+    premium_sales_enabled: bool = False
 
     def __post_init__(self) -> None:
         if self.app_env not in APP_ENVS:
@@ -227,4 +233,5 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         public_base_url=os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/"),
         cors_allow_origins=cors_origins,
         enable_mainnet_x402=raw_mainnet == "true",
+        premium_sales_enabled=os.getenv("PREMIUM_SALES_ENABLED", "").strip().lower() == "true",
     )
