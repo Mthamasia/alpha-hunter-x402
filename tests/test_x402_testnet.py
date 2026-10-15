@@ -83,6 +83,7 @@ class FakeFacilitator:
 
 def x402_settings(**overrides) -> Settings:
     base = dict(payment_mode="x402-testnet", pay_to=RECEIVER, x402_facilitator_url=FACILITATOR)
+    base.setdefault("premium_sales_enabled", True)
     base.update(overrides)
     return Settings(**base)
 
@@ -107,6 +108,7 @@ def mainnet_x402_settings(**overrides) -> Settings:
         public_base_url="https://api.example.test",
         cors_allow_origins=("https://app.example.test",),
     )
+    base.setdefault("premium_sales_enabled", True)
     base.update(overrides)
     return Settings(**base)
 

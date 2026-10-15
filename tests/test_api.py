@@ -29,6 +29,7 @@ def test_cors_is_explicit_and_exposes_x402_headers():
         create_app(
             Settings(
                 cors_allow_origins=("https://app.example.test",),
+                premium_sales_enabled=True,
             )
         )
     )

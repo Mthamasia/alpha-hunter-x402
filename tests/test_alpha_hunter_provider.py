@@ -87,6 +87,7 @@ def alpha_client(monkeypatch, handler):
         payment_mode="disabled",
         intelligence_provider="alpha_hunter",
         ahx_bridge_service_token=SERVICE_TOKEN,
+        premium_sales_enabled=True,
     )
 
     return create_app(settings)
