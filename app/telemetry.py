@@ -44,6 +44,7 @@ SERVED_FROM_CACHE = "cache"
 SERVED_FROM_BRIDGE = "bridge"
 SERVED_FROM_STUB = "stub"
 SERVED_FROM_BLOCKED = "blocked"  # quota/rate-limit rejection; never a successful query
+SERVED_FROM_ERROR = "error"  # provider/bridge failure; nothing delivered, nothing charged
 
 REVENUE_NONE = "none"
 REVENUE_SIMULATED = "simulated"

@@ -47,7 +47,12 @@ def is_valid_solana_address(value: str) -> bool:
 
 
 class InvestigateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "examples": [{"chain": "solana", "mint": "So11111111111111111111111111111111111111112"}]
+        },
+    )
 
     chain: Literal["solana"]
     mint: str = Field(

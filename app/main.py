@@ -4,6 +4,7 @@ import asyncio
 import ipaddress
 import logging
 import os
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -51,6 +52,7 @@ from app.telemetry import (
     SERVED_FROM_BLOCKED,
     SERVED_FROM_BRIDGE,
     SERVED_FROM_CACHE,
+    SERVED_FROM_ERROR,
     SERVED_FROM_STUB,
     CostLedger,
     HeliusCallTracker,
@@ -300,6 +302,7 @@ def create_app(
     async def request_context(request: Request, call_next):
         # request_id sempre gerado no servidor (não confiamos em IDs do cliente).
         request.state.request_id = str(uuid.uuid4())
+        started = time.perf_counter()
         cl = request.headers.get("content-length")
         if cl is not None:
             if not cl.isdigit():
@@ -314,8 +317,9 @@ def create_app(
         response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
         response.headers["Cache-Control"] = "no-store"
         # Loga apenas metadados; nunca headers/body (podem conter provas de pagamento).
-        logger.info("%s %s -> %s rid=%s", request.method, request.url.path,
-                    response.status_code, request.state.request_id)
+        logger.info("%s %s -> %s rid=%s latency_ms=%.1f", request.method, request.url.path,
+                    response.status_code, request.state.request_id,
+                    (time.perf_counter() - started) * 1000)
         return response
 
     @app.exception_handler(RequestValidationError)
@@ -339,6 +343,27 @@ def create_app(
     @app.exception_handler(ProviderError)
     async def _provider_error(request: Request, exc: ProviderError):
         logger.error("%s rid=%s", exc.code, _rid(request))
+        query = getattr(request.state, "query", None)
+        if query is not None:
+            # Failures are telemetry too: nothing was delivered or charged,
+            # but the operator must see bridge errors per route/mint/agent.
+            try:
+                route, chain, mint = query
+                record_query(
+                    cost_ledger,
+                    tracker=HeliusCallTracker(),
+                    request_id=_rid(request),
+                    route=route,
+                    chain=chain,
+                    mint=mint,
+                    agent_id=_agent_id(request),
+                    served_from=SERVED_FROM_ERROR,
+                    revenue_usd=None,
+                    revenue_kind=REVENUE_NONE,
+                    credit_cost_usd=settings.helius_credit_cost_usd,
+                )
+            except Exception:
+                logger.exception("telemetry failed while recording provider error rid=%s", _rid(request))
         return _error(exc.status_code, exc.code, exc.message, _rid(request))
 
     @app.exception_handler(Exception)
@@ -384,11 +409,12 @@ def create_app(
                     "name": "Free token availability/freshness preview",
                     "description": (
                         "Free, no payment required. Returns only availability, "
-                        "data age, FRESH/STALE classification and data-quality "
-                        "limitations for a Solana token -- never creator, wallet "
-                        "activity, behavioral findings or evidence. Rate-limited "
-                        "per caller; see /v1/token/investigate for the full "
-                        "paid investigation."
+                        "data age, FRESH/STALE classification, data-quality "
+                        "limitations and premium_eligible (whether the paid "
+                        "investigation would currently return chargeable, "
+                        "verifiable intelligence, with reason codes if not) -- "
+                        "never creator, wallet activity, behavioral findings or "
+                        "evidence. Rate-limited per caller. Call this before paying."
                     ),
                     "price_usd": "0",
                     "payment": {"required": False},
@@ -428,6 +454,10 @@ def create_app(
                         "concentration, historical behavioral findings and "
                         "traceable evidence for AI trading agents. "
                         "Returns explicit data-quality and freshness status. "
+                        "Payment is settled only when at least one recent, "
+                        "mint-linked, verifiable Solana transaction backs an "
+                        "observed finding; otherwise HTTP 503 "
+                        "intelligence_not_ready with reason codes and no charge. "
                         "Does not execute trades."
                     ),
                     "price_usd": str(settings.price_usd),
@@ -500,6 +530,7 @@ def create_app(
     def investigate(body: InvestigateRequest, request: Request):
         decision = gate.verify(request.headers.get(PAYMENT_HEADER), str(request.url.path))
         tracker = HeliusCallTracker()
+        request.state.query = (ROUTE_INVESTIGATE, body.chain, body.mint)
         result = provider.investigate(body.chain, body.mint)
         eligibility = assess_premium_eligibility(
             result, body.mint, max_evidence_age_seconds=settings.paid_evidence_max_age_seconds
@@ -614,6 +645,7 @@ def create_app(
             result = cached
             served_from = SERVED_FROM_CACHE
         else:
+            request.state.query = (ROUTE_PREVIEW, body.chain, body.mint)
             result = provider.investigate(body.chain, body.mint)
             preview_cache.set(cache_key, result)
             served_from = SERVED_FROM_BRIDGE if provider.name == "alpha_hunter" else SERVED_FROM_STUB
