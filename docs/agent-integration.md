@@ -82,6 +82,25 @@ When a 200 is returned under x402 Mainnet:
 Verify independently: look up each `transaction_signature` on any Solana
 explorer and check it touches the mint.
 
+## Payment safety
+
+- Settlement happens only after the route finished and returned < 400
+  (x402-avm 2.0.2 middleware). A 503 `intelligence_not_ready` is never
+  settled; tests assert the facilitator's `settle()` was not called.
+- If settlement fails, the library replaces the body with a 402; the
+  intelligence is not delivered.
+- One payment proof buys one delivery: reusing a settled proof returns
+  `409 payment_proof_already_used` before any work is done. A proof that
+  was not settled (e.g. 503) can be retried.
+- Paid calls are attributed to the on-chain payer address and settlement
+  transaction from the facilitator, not to the `X-Agent-Id` label.
+
+## Reference agent
+
+`examples/agent_preview_then_pay.py` (standard library only) runs
+discovery, free preview, decision, and decodes the 402 offer. It never
+signs or pays.
+
 ## What this API is not
 
 Not trade execution, not investment advice, not a rug guarantee. Treat it

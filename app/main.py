@@ -26,6 +26,7 @@ from app.payments.gate import (
     PaymentGate,
     PaymentRequired,
 )
+from app.payments.replay import PaymentReplayGuard, proof_hash
 from app.providers import (
     IntelligenceProvider,
     ProviderError,
@@ -231,72 +232,96 @@ def create_app(
         from app.payments.x402_avm import build_x402_middleware
 
         x402_mw = build_x402_middleware(settings, facilitator_client)
+        replay_guard = PaymentReplayGuard(settings.quota_db_path)
+        app.state.replay_guard = replay_guard
 
         # Registrada antes de request_context, então roda DEPOIS dela (Starlette:
         # a última middleware registrada é a mais externa).
         @app.middleware("http")
         async def x402_payment(request: Request, call_next):
-            try:
-                response = await x402_mw(request, call_next)
-            except Exception:
-                # Fail closed: facilitator indisponível / rota não suportada -> 503.
-                logger.exception("x402 payment layer error rid=%s", _rid(request))
-                return _error(503, "payment_unavailable",
-                              "payment facilitator unavailable", _rid(request))
-
-            # Settlement happens INSIDE x402_mw, after the route already ran
-            # (and already wrote a PENDING telemetry row -- see `investigate`
-            # below). Only now do we know the real outcome, so only now do
-            # we finalize revenue to SETTLED/FAILED. If this header is
-            # absent, settlement was never attempted (e.g. no payment, or
-            # verification failed before the route ran) and there is no
-            # pending row to finalize either -- `finalize_revenue` is a
-            # harmless no-op in that case.
-            #
-            # CRITICAL: a telemetry failure here must NEVER change what the
-            # client receives. A customer who paid and whose settlement
-            # already succeeded must get their 200 response even if SQLite
-            # itself is down right now -- that is a reconciliation problem,
-            # not a reason to turn a successful paid delivery into a 503.
-            # So this entire block is isolated: any exception is logged at
-            # CRITICAL (a real paid settlement whose revenue bookkeeping is
-            # now unreconciled, needing manual follow-up) and swallowed.
-            settlement_header = response.headers.get(X402_SETTLEMENT_HEADER)
-            request_id = _rid(request)
-            if request_id:
+            # One payment proof buys at most one delivery. Claimed BEFORE the
+            # library verifies/settles, released if nothing was settled.
+            proof = request.headers.get("payment-signature") or request.headers.get("x-payment")
+            digest = None
+            if proof and request.method == "POST" and request.url.path == "/v1/token/investigate":
+                digest = proof_hash(proof)
                 try:
-                    if settlement_header:
+                    acquired = replay_guard.try_acquire(digest, _rid(request))
+                except Exception:
+                    logger.exception("payment replay store unavailable rid=%s", _rid(request))
+                    return _error(503, "payment_unavailable",
+                                  "payment bookkeeping unavailable; nothing was charged", _rid(request))
+                if not acquired:
+                    return _error(
+                        409,
+                        "payment_proof_already_used",
+                        "This payment proof was already used or is being processed; it was not charged again.",
+                        _rid(request),
+                    )
+
+            settled = False
+            try:
+                try:
+                    response = await x402_mw(request, call_next)
+                except Exception:
+                    # Fail closed: facilitator indisponível / rota não suportada -> 503.
+                    logger.exception("x402 payment layer error rid=%s", _rid(request))
+                    return _error(503, "payment_unavailable",
+                                  "payment facilitator unavailable", _rid(request))
+
+                # Settlement happens INSIDE x402_mw, after the route already ran
+                # and only when it returned < 400 (x402-avm 2.0.2
+                # http/middleware/fastapi.py). A failed settlement is swapped by
+                # the library for a 402 without PAYMENT-RESPONSE, so content is
+                # not delivered. Only now do we know the real outcome.
+                #
+                # CRITICAL: a telemetry failure here must NEVER change what the
+                # client receives; it is logged as an unreconciled settlement.
+                settlement_header = response.headers.get(X402_SETTLEMENT_HEADER)
+                settlement = None
+                if settlement_header:
+                    try:
                         settlement = decode_payment_response_header(settlement_header)
-                        if settlement.success:
+                        settled = bool(settlement.success)
+                    except Exception:
+                        logger.critical("undecodable PAYMENT-RESPONSE rid=%s", _rid(request), exc_info=True)
+                        # Unknown outcome: never let the same proof be reused.
+                        settled = True
+                request_id = _rid(request)
+                if request_id:
+                    try:
+                        if settlement is not None:
                             cost_ledger.finalize_revenue(
-                                request_id, revenue_kind=REVENUE_SETTLED, revenue_usd=settings.price_usd
+                                request_id,
+                                revenue_kind=REVENUE_SETTLED if settlement.success else REVENUE_FAILED,
+                                revenue_usd=settings.price_usd if settlement.success else None,
+                                payer=getattr(settlement, "payer", None),
+                                settlement_tx=getattr(settlement, "transaction", None) or None,
                             )
-                        else:
+                        elif response.status_code != 200:
+                            # No-op unless a PENDING row exists (see finalize_revenue).
                             cost_ledger.finalize_revenue(
                                 request_id, revenue_kind=REVENUE_FAILED, revenue_usd=None
                             )
-                    elif response.status_code != 200:
-                        # The library swaps a failed-settlement response for a
-                        # 402 with no PAYMENT-RESPONSE header at all (confirmed
-                        # empirically, not documented). `finalize_revenue` only
-                        # touches a row that is still PENDING, so this is a
-                        # harmless no-op for every other non-200 response that
-                        # never recorded a pending row in the first place (no
-                        # payment provided, validation errors, unreachable
-                        # facilitator, mainnet no-charge decisions, ...).
-                        cost_ledger.finalize_revenue(
-                            request_id, revenue_kind=REVENUE_FAILED, revenue_usd=None
+                    except Exception:
+                        logger.critical(
+                            "UNRECONCILED SETTLEMENT: telemetry finalization failed after a real "
+                            "x402 settlement outcome was already known (rid=%s, settled=%s). "
+                            "The client response was NOT altered. Manual reconciliation needed.",
+                            request_id,
+                            settled,
+                            exc_info=True,
                         )
-                except Exception:
-                    logger.critical(
-                        "UNRECONCILED SETTLEMENT: telemetry finalization failed after a real "
-                        "x402 settlement outcome was already known (rid=%s, settled=%s). "
-                        "The client response was NOT altered. Manual reconciliation needed.",
-                        request_id,
-                        response.status_code == 200,
-                        exc_info=True,
-                    )
-            return response
+                return response
+            finally:
+                if digest is not None:
+                    try:
+                        if settled:
+                            replay_guard.mark_settled(digest)
+                        else:
+                            replay_guard.release(digest)
+                    except Exception:
+                        logger.critical("payment replay store update failed rid=%s", _rid(request), exc_info=True)
 
     @app.middleware("http")
     async def request_context(request: Request, call_next):

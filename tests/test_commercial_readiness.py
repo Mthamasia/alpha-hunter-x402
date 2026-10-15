@@ -18,7 +18,6 @@ from tests.conftest import USDC_MINT, WSOL_MINT
 from tests.evidence_helpers import tx_evidence
 from tests.test_x402_testnet import (
     FakeFacilitator,
-    fake_signature_header,
     get_requirements,
     mainnet_x402_settings,
 )
@@ -63,12 +62,26 @@ def build(monkeypatch, bridge, facilitator=None, **settings):
     return TestClient(app, raise_server_exceptions=False), fac, calls
 
 
-def paid(client, mint=WSOL_MINT, agent="agent-a"):
+def unique_proof(requirements, nonce=None) -> str:
+    """Synthetic proof, distinct per call (a real wallet signs a new txn)."""
+    import uuid
+
+    from x402.http.utils import encode_payment_signature_header
+    from x402.schemas import PaymentPayload
+
+    payload = PaymentPayload(
+        payload={"paymentGroup": [], "paymentIndex": 0, "nonce": nonce or uuid.uuid4().hex},
+        accepted=requirements,
+    )
+    return encode_payment_signature_header(payload)
+
+
+def paid(client, mint=WSOL_MINT, agent="agent-a", proof=None):
     req = get_requirements(client).accepts[0]
     return client.post(
         URL,
         json={"chain": "solana", "mint": mint},
-        headers={"PAYMENT-SIGNATURE": fake_signature_header(req), "X-Agent-Id": agent},
+        headers={"PAYMENT-SIGNATURE": proof or unique_proof(req), "X-Agent-Id": agent},
     )
 
 
@@ -147,7 +160,7 @@ def test_invalid_mint_never_reaches_bridge_or_settlement(monkeypatch):
     client, fac, calls = build(monkeypatch, lambda _u: httpx.Response(200, json=good_payload()))
     req = get_requirements(client).accepts[0]
     r = client.post(URL, json={"chain": "solana", "mint": "0OIl" * 10},
-                    headers={"PAYMENT-SIGNATURE": fake_signature_header(req)})
+                    headers={"PAYMENT-SIGNATURE": unique_proof(req)})
     assert r.status_code in (402, 422)
     assert fac.settle_calls == 0
     assert calls["bridge"] == 0
@@ -322,3 +335,149 @@ def test_operator_report_reads_ledger_without_writing(monkeypatch, tmp_path):
     assert out["distinct_paying_declared_agents"] == 1
     assert out["helius_calls_total"] == 0
     assert os.path.getmtime(db) == before
+
+
+# ------------------------------------------------------------ settlement safety
+def test_settlement_happens_only_after_quality_gate(monkeypatch):
+    """Proves ordering, not just the status code: the facilitator's settle()
+    must never run before the route finished, and never for a 503."""
+    order = []
+    fac = FakeFacilitator(network=ALGORAND_MAINNET_CAIP2)
+    real_settle = fac.settle
+
+    async def settle(payload, requirements):
+        order.append("settle")
+        return await real_settle(payload, requirements)
+
+    fac.settle = settle
+
+    def bridge(_u):
+        order.append("bridge")
+        return httpx.Response(200, json=state["payload"])
+
+    state = {"payload": good_payload(evidence=[])}
+    client, _, _ = build(monkeypatch, bridge, facilitator=fac)
+    assert paid(client).status_code == 503
+    assert order == ["bridge"]
+    state["payload"] = good_payload()
+    assert paid(client).status_code == 200
+    assert order == ["bridge", "bridge", "settle"]
+
+
+def test_same_proof_cannot_be_settled_twice(monkeypatch):
+    client, fac, calls = build(monkeypatch, lambda _u: httpx.Response(200, json=good_payload()))
+    req = get_requirements(client).accepts[0]
+    proof = unique_proof(req, nonce="fixed")
+    first = paid(client, proof=proof)
+    second = paid(client, proof=proof)
+    assert first.status_code == 200
+    assert second.status_code == 409
+    assert second.json()["error"]["code"] == "payment_proof_already_used"
+    assert fac.settle_calls == 1
+    assert calls["bridge"] == 1  # replay never reached the bridge
+
+
+def test_unsettled_proof_can_be_retried(monkeypatch):
+    """A 503 (no charge) must not burn the buyer's proof."""
+    state = {"payload": good_payload(evidence=[])}
+    client, fac, _ = build(monkeypatch, lambda _u: httpx.Response(200, json=state["payload"]))
+    req = get_requirements(client).accepts[0]
+    proof = unique_proof(req, nonce="retry")
+    assert paid(client, proof=proof).status_code == 503
+    state["payload"] = good_payload()
+    assert paid(client, proof=proof).status_code == 200
+    assert fac.settle_calls == 1
+
+
+def test_failed_settlement_releases_proof_and_records_failure(monkeypatch):
+    fac = FakeFacilitator(network=ALGORAND_MAINNET_CAIP2, settle_ok=False)
+    client, _, _ = build(monkeypatch, lambda _u: httpx.Response(200, json=good_payload()), facilitator=fac)
+    r = paid(client)
+    assert r.status_code == 402
+    assert "intelligence" not in r.text  # content withheld when settlement fails
+    row = client.app.state.cost_ledger.all_records()[0]
+    assert row["revenue_kind"] == "failed"
+
+
+def test_paid_call_records_onchain_payer(monkeypatch):
+    client, _, _ = build(monkeypatch, lambda _u: httpx.Response(200, json=good_payload()))
+    assert paid(client, agent="spoofable-label").status_code == 200
+    row = client.app.state.cost_ledger.all_records()[0]
+    assert row["agent_id"] == "spoofable-label"
+    assert row["revenue_kind"] == "settled"
+    assert row["settlement_tx"] == "FAKE-TX-ID"
+
+
+def test_facilitator_down_is_not_charged(monkeypatch):
+    fac = FakeFacilitator(network=ALGORAND_MAINNET_CAIP2, supported=False)
+    client, _, calls = build(monkeypatch, lambda _u: httpx.Response(200, json=good_payload()), facilitator=fac)
+    r = client.post(URL, json={"chain": "solana", "mint": WSOL_MINT})
+    assert r.status_code == 503
+    assert fac.settle_calls == 0
+    assert calls["bridge"] == 0
+
+
+# ------------------------------------------------------------ reference agent demo
+def _testclient_http(client):
+    def call(method, path, body):
+        r = client.request(method, path, json=body) if body is not None else client.request(method, path)
+        return r.status_code, dict(r.headers), r.json()
+    return call
+
+
+def test_reference_agent_pays_only_when_eligible(monkeypatch):
+    from examples.agent_preview_then_pay import decide
+
+    state = {"payload": good_payload(evidence=[{"source": "read-only-bridge"}])}
+    client, fac, _ = build(monkeypatch, lambda _u: httpx.Response(200, json=state["payload"]))
+    out = decide(_testclient_http(client), WSOL_MINT)
+    assert out["discovered"] and out["price_usd"] == "0.05"
+    assert out["decision"] == "DO_NOT_PAY"
+    assert out["reasons"] == ["no_verifiable_transaction_evidence"]
+
+    state["payload"] = good_payload()
+    client, fac, _ = build(monkeypatch, lambda _u: httpx.Response(200, json=state["payload"]))
+    out = decide(_testclient_http(client), WSOL_MINT)
+    assert out["decision"] == "READY_TO_PAY"
+    assert out["offer"]["amount_atomic"] == "50000"
+    assert fac.settle_calls == 0  # the demo never pays
+
+
+# ------------------------------------------------------------ cross-repo contract
+def _reference_bridge_payload():
+    """Golden output of alpha-hunter-x app/x402_bridge_reference (synthetic
+    rows), with timestamps re-anchored to now."""
+    import json
+    import re
+    import time
+    from pathlib import Path
+
+    text = (Path(__file__).parent / "fixtures" / "reference_bridge_payload.json").read_text()
+    now = int(time.time())
+    text = re.sub(r'"__NOW_MINUS_(\d+)__"', lambda m: str(now - int(m.group(1))), text)
+    return json.loads(text)
+
+
+def test_reference_bridge_output_is_sellable_and_explained(monkeypatch):
+    payload = _reference_bridge_payload()
+    client, fac, _ = build(monkeypatch, lambda _u: httpx.Response(200, json=payload))
+    preview = client.post(PREVIEW, json={"chain": "solana", "mint": WSOL_MINT}).json()
+    assert preview["premium_eligible"] is True
+    r = paid(client)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["intelligence"]["evidence"][0]["explorer_url"].startswith("https://solscan.io/tx/")
+    assert "2 rugs" in body["intelligence"]["behavioral_findings"]["explanation"]
+    assert body["intelligence"]["creator"]["profile"]["trust_score"] == 12.0  # backed by outcomes
+    assert fac.settle_calls == 1
+
+
+def test_reference_bridge_old_snapshot_is_not_sellable(monkeypatch):
+    payload = _reference_bridge_payload()
+    for item in payload["evidence"]:
+        item["block_time"] -= 5 * 86400
+    client, fac, _ = build(monkeypatch, lambda _u: httpx.Response(200, json=payload))
+    r = paid(client)
+    assert r.status_code == 503
+    assert "evidence_older_than_freshness_window" in r.json()["error"]["reasons"]
+    assert fac.settle_calls == 0

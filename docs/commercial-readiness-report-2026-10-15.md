@@ -75,3 +75,19 @@ Dependências montadas a partir dos fontes no GitHub (PyPI inacessível no sandb
 4. A produção roda um gate que pode cobrar por evidência fraca.
 
 **Única próxima decisão necessária:** autorizar a execução, na VPS, de uma auditoria somente leitura da ponte. Ela consiste em versionar `app/x402_bridge` no GitHub e capturar respostas reais para uma amostra fixa de mints, sem Helius e sem escrita. Essa execução exige acesso à VPS que este ambiente não tem. Com isso decidimos se o contrato de evidência (`bridge-evidence-contract.md`) é atendível a partir das tabelas existentes. Até lá, o recomendado é **não divulgar a API como pronta** e, por decisão sua, colocar a produção em `PAYMENT_MODE=disabled` ou implantar esta branch (que só cobra com evidência comprovável).
+
+---
+
+## Atualização (sessão de continuidade, 2026-10-15 noite)
+
+**Ainda NO-GO.** Acessos efetivos: GitHub (leitura/escrita nos dois repositórios) e GETs públicos. **Sem acesso** ao Railway (painel, CLI ou API) nem à VPS: o chat não está vinculado a um computador e o proxy do sandbox nega conexão a esses hosts. Por isso a suspensão de `PAYMENT_MODE` **não foi executada** e a produção continua intacta em `4df5dbe`.
+
+Feito:
+- **Ordem de liquidação provada no código-fonte do x402-avm 2.0.2** (`http/middleware/fastapi.py`): `settle` só ocorre após a rota retornar < 400; falha de settle → 402 sem conteúdo. Teste registra a ordem real das chamadas (`bridge` antes de `settle`, nenhum `settle` em 503).
+- **Anti-replay**: a mesma prova de pagamento não liquida duas vezes (409 antes de qualquer trabalho); prova não liquidada pode ser reutilizada.
+- **Identidade confiável**: telemetria grava `payer` e `settlement_tx` do facilitador; `X-Agent-Id` segue como rótulo.
+- **Livros obrigatórios**: `x402-mainnet` recusa iniciar com `TELEMETRY_DB_PATH`/`QUOTA_DB_PATH` em memória. *Consequência*: implantar o PR #8 em mainnet sem volume persistente faz o serviço **não subir** — configure o volume antes.
+- **Ponte de referência** read-only no repositório AHX (PR `alpha-hunter-x#2`) gerando o contrato de evidência a partir de `events`/`tokens`/`trades`/`creator_profiles`; golden dessa ponte é aceito como vendável pelo PR #8 quando recente e recusado quando antigo.
+- **Agente de referência** (`examples/agent_preview_then_pay.py`) e plano de validação de demanda (`docs/demand-validation.md`).
+
+Ainda não demonstrado: qualquer resposta com dados **reais** da VPS. Assinaturas válidas em formato não provam existência on-chain; a ponte de referência inclui `explorer_url` para verificação independente, e a verificação contra registros armazenados exige acesso de leitura ao banco da VPS.

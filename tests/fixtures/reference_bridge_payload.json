@@ -1,0 +1,79 @@
+{
+  "schema_version": "1.0",
+  "mint": "So11111111111111111111111111111111111111112",
+  "source": "alpha_hunter_x",
+  "freshness": {
+    "last_activity_unix": "__NOW_MINUS_120__",
+    "age_seconds": 120,
+    "stale_after_seconds": 3600,
+    "is_stale": false
+  },
+  "creator": {
+    "address": "3ct4z3q2XHEGTb4Noe3Wh5iySA8e5UZawUXkWAnkfh5J",
+    "profile": {
+      "observed_launches": 3,
+      "confirmed_outcomes": 3,
+      "successful_launches": 1,
+      "failed_launches": 2,
+      "rug_count": 2,
+      "dead_tokens": 0,
+      "trust_score": 12.0
+    }
+  },
+  "wallet_activity": {
+    "profile": {
+      "total_events": 1,
+      "distinct_trading_wallets": 0,
+      "stored_trades": 0
+    },
+    "recent_events": [
+      {
+        "type": "BUY",
+        "signature": "2NCQJwfWBQZKhJv6Q4EzMHhyB3YK85RYSuV8gMdfXG6xdx3FywPcaT4uYhNHVd7f2df6jkrBRhabwFfVuyw5ZXbZ",
+        "block_time": "__NOW_MINUS_120__"
+      }
+    ],
+    "market": {
+      "marketcap": 2500000.0,
+      "liquidity": 90000.0,
+      "volume": null,
+      "source": "ahx_tokens_table",
+      "updated_at_unix": "__NOW_MINUS_300__"
+    }
+  },
+  "behavioral_findings": {
+    "alerts": [
+      {
+        "reason": "creator_previous_rugs",
+        "count": 2
+      }
+    ],
+    "explanation": "Creator has 3 observed launches (1 successful, 2 failed, 2 rugs). 1 on-chain events stored for this mint.",
+    "model_scores": {
+      "alpha_score": 71.0,
+      "risk_score": 40.0,
+      "decision": "WAIT",
+      "note": "Model outputs, not observations."
+    }
+  },
+  "concentration": {
+    "holders": 812
+  },
+  "evidence": [
+    {
+      "type": "BUY",
+      "mint": "So11111111111111111111111111111111111111112",
+      "transaction_signature": "2NCQJwfWBQZKhJv6Q4EzMHhyB3YK85RYSuV8gMdfXG6xdx3FywPcaT4uYhNHVd7f2df6jkrBRhabwFfVuyw5ZXbZ",
+      "slot": 437168570,
+      "block_time": "__NOW_MINUS_120__",
+      "explorer_url": "https://solscan.io/tx/2NCQJwfWBQZKhJv6Q4EzMHhyB3YK85RYSuV8gMdfXG6xdx3FywPcaT4uYhNHVd7f2df6jkrBRhabwFfVuyw5ZXbZ",
+      "source": "ahx_events_table"
+    }
+  ],
+  "data_quality": {
+    "status": "FRESH",
+    "limitations": [
+      "Read-only snapshot of Alpha Hunter X stored data."
+    ]
+  }
+}

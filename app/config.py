@@ -189,6 +189,13 @@ class Settings:
             raise ConfigError("PAYMENT_MODE=x402-mainnet exige APP_ENV=production.")
         if self.intelligence_provider != "alpha_hunter":
             raise ConfigError("PAYMENT_MODE=x402-mainnet exige INTELLIGENCE_PROVIDER=alpha_hunter.")
+        # Selling without durable books is not allowed: revenue, payer and
+        # replay records would vanish on every redeploy/restart.
+        if self.telemetry_db_path == ":memory:" or self.quota_db_path == ":memory:":
+            raise ConfigError(
+                "PAYMENT_MODE=x402-mainnet exige TELEMETRY_DB_PATH e QUOTA_DB_PATH persistentes "
+                "(ex.: volume do Railway), nunca :memory:."
+            )
         if not self.pay_to:
             raise ConfigError("PAY_TO é obrigatório em PAYMENT_MODE=x402-mainnet.")
         if not is_valid_address(self.pay_to):

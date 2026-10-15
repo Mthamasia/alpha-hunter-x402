@@ -108,9 +108,17 @@ def mainnet_x402_settings(**overrides) -> Settings:
         ahx_bridge_service_token="test-token",
         public_base_url="https://api.example.test",
         cors_allow_origins=("https://app.example.test",),
+        telemetry_db_path=str(_tmpdir() / "telemetry.db"),
+        quota_db_path=str(_tmpdir() / "quota.db"),
     )
     base.update(overrides)
     return Settings(**base)
+
+
+def _tmpdir() -> Path:
+    import tempfile
+
+    return Path(tempfile.mkdtemp(prefix="ahx-x402-test-"))
 
 
 def make_mainnet_x402_client(facilitator=None, **overrides):
@@ -605,3 +613,9 @@ def test_env_example_has_no_secrets_and_empty_pay_to():
     assert env["PAYMENT_MODE"] == "disabled"
     assert env["X402_FACILITATOR_URL"] == FACILITATOR
     assert not any(k in name.lower() for name in env for k in ("key", "secret", "mnemonic", "seed"))
+
+
+@pytest.mark.parametrize("field", ["telemetry_db_path", "quota_db_path"])
+def test_mainnet_requires_persistent_books(field):
+    with pytest.raises(ConfigError, match="persistentes"):
+        mainnet_x402_settings(**{field: ":memory:"})

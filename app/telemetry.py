@@ -363,6 +363,14 @@ class CostLedger:
             self._persistent_conn.row_factory = sqlite3.Row
         with self._lock, self._connect() as conn:
             conn.executescript(_SCHEMA)
+            # Additive migration: on-chain payer identity and settlement tx
+            # (public data from the facilitator's settlement response). The
+            # payer address is the only authenticated customer identity a
+            # paid call has; X-Agent-Id remains an unauthenticated label.
+            existing = {row[1] for row in conn.execute("PRAGMA table_info(query_costs)")}
+            for column in ("payer", "settlement_tx"):
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE query_costs ADD COLUMN {column} TEXT")
 
     def _connect(self) -> sqlite3.Connection:
         # `Connection.__enter__`/`__exit__` only commit/rollback the
@@ -391,7 +399,13 @@ class CostLedger:
             return conn.execute("SELECT * FROM query_costs ORDER BY timestamp").fetchall()
 
     def finalize_revenue(
-        self, request_id: str, *, revenue_kind: str, revenue_usd: Decimal | None
+        self,
+        request_id: str,
+        *,
+        revenue_kind: str,
+        revenue_usd: Decimal | None,
+        payer: str | None = None,
+        settlement_tx: str | None = None,
     ) -> bool:
         """Updates a PENDING row once real x402 settlement is confirmed
         (success or failure) by the middleware -- never by the route
@@ -419,12 +433,15 @@ class CostLedger:
                 else None
             )
             conn.execute(
-                "UPDATE query_costs SET revenue_usd = ?, revenue_kind = ?, margin_usd_estimated = ? "
+                "UPDATE query_costs SET revenue_usd = ?, revenue_kind = ?, margin_usd_estimated = ?, "
+                "payer = COALESCE(?, payer), settlement_tx = COALESCE(?, settlement_tx) "
                 "WHERE request_id = ? AND revenue_kind = ?",
                 (
                     str(revenue_usd) if revenue_usd is not None else None,
                     revenue_kind,
                     margin,
+                    payer,
+                    settlement_tx,
                     request_id,
                     REVENUE_PENDING,
                 ),

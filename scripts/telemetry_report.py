@@ -30,6 +30,8 @@ def report(db_path: str, since: str | None = None) -> dict:
 
     settled = [r for r in rows if r["revenue_kind"] == "settled"]
     agents = {r["agent_id"] for r in rows if r["agent_id"]}
+    keys = rows[0].keys() if rows else []
+    payers = {r["payer"] for r in settled if "payer" in keys and r["payer"]}
     paying_agents = {r["agent_id"] for r in settled if r["agent_id"]}
     return {
         "since": since,
@@ -39,10 +41,11 @@ def report(db_path: str, since: str | None = None) -> dict:
         "by_revenue_kind": count("revenue_kind"),
         "distinct_declared_agents": len(agents),
         "distinct_paying_declared_agents": len(paying_agents),
+        "distinct_onchain_payers": len(payers),
         "settled_sales": len(settled),
         "settled_revenue_usd": str(sum((Decimal(r["revenue_usd"]) for r in settled), Decimal("0"))),
         "helius_calls_total": sum(r["helius_call_count"] for r in rows),
-        "note": "agent_id is an unauthenticated X-Agent-Id label; settled sales are the only proof of paying demand.",
+        "note": "agent_id is an unauthenticated X-Agent-Id label; on-chain payers and settled sales are the only proof of paying demand.",
     }
 
 
