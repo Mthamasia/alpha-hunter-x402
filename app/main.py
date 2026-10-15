@@ -634,6 +634,12 @@ def create_app(
                 status=result.data_quality.status,
                 limitations=[*result.data_quality.limitations, *quality_notes],
             ),
+            eligibility={
+                "premium_eligible": eligibility.eligible,
+                "reasons": eligibility.reasons,
+                "newest_evidence_age_seconds": eligibility.newest_evidence_age_seconds,
+                "max_evidence_age_seconds": settings.paid_evidence_max_age_seconds,
+            },
         )
         response = JSONResponse(content=payload.model_dump(mode="json"))
         if decision.response_header:

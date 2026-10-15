@@ -62,8 +62,8 @@ def test_valid_mint_matches_schema(client):
     InvestigateResponse.model_validate(body)  # schema estrito
     assert set(body) == {
         "schema_version", "request_id", "chain", "mint", "status",
-        "generated_at", "intelligence", "data_quality",
-    }
+        "generated_at", "intelligence", "data_quality", "eligibility",
+    }  # "eligibility" is an additive field (schema 1.0 remains backward compatible)
     assert body["schema_version"] == "1.0"
     assert body["chain"] == "solana"
     assert body["mint"] == WSOL_MINT

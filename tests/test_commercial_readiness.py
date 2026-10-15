@@ -553,3 +553,55 @@ def test_unwritable_storage_fails_closed(monkeypatch, tmp_path):
     monkeypatch.setattr(client.app.state.quota_store, "_connect", broken)
     p = client.post(PREVIEW, json={"chain": "solana", "mint": WSOL_MINT})
     assert p.status_code == 429  # quota store unavailable -> denied, not unlimited
+
+
+# ------------------------------------------------------------ provenance labeling (phase 3)
+def test_market_data_needs_source_and_time_and_old_is_historical(monkeypatch):
+    import time as _t
+    now = int(_t.time())
+    payload = good_payload(wallet_activity={
+        "profile": {"total_events": 41},
+        "market": {"marketcap": 2_500_000.0, "source": "ahx_tokens_table", "updated_at_unix": now - 3 * 86400},
+    })
+    client, _, _ = build(monkeypatch, lambda _u: httpx.Response(200, json=payload))
+    body = paid(client).json()
+    market = body["intelligence"]["wallet_activity"]["market"]
+    assert market["marketcap"] == 2_500_000.0
+    assert market["freshness"] == "historical"
+    assert "Market data is historical, not current." in body["data_quality"]["limitations"]
+
+
+def test_model_scores_are_separated_and_evidence_is_labeled(monkeypatch):
+    payload = good_payload(behavioral_findings={
+        "alerts": [{"reason": "creator_previous_rugs", "count": 2}],
+        "explanation": "Creator has 3 observed launches (2 rugs).",
+        "scores": {"alpha_score": 88}, "decision": "BUY",
+    })
+    client, _, _ = build(monkeypatch, lambda _u: httpx.Response(200, json=payload))
+    body = paid(client).json()
+    f = body["intelligence"]["behavioral_findings"]
+    assert "scores" not in f and "decision" not in f
+    assert f["model_scores"]["kind"] == "model_output"
+    ev = body["intelligence"]["evidence"][0]
+    assert ev["verification"] == "recorded_not_reverified"
+    assert ev["explorer_url"].startswith("https://solscan.io/tx/")
+
+
+def test_explanation_alone_cannot_sell(monkeypatch):
+    payload = good_payload(
+        creator={"address": "C", "profile": {}},
+        wallet_activity={"profile": {"total_events": 0}},
+        behavioral_findings={"alerts": [], "explanation": "This token shows strong smart money interest."},
+    )
+    client, fac, _ = build(monkeypatch, lambda _u: httpx.Response(200, json=payload))
+    r = paid(client)
+    assert r.status_code == 503
+    assert "no_observed_behavioral_finding" in r.json()["error"]["reasons"]
+    assert fac.settle_calls == 0
+
+
+def test_paid_response_states_its_eligibility(monkeypatch):
+    client, _, _ = build(monkeypatch, lambda _u: httpx.Response(200, json=good_payload()))
+    e = paid(client).json()["eligibility"]
+    assert e["premium_eligible"] is True and e["reasons"] == []
+    assert 0 <= e["newest_evidence_age_seconds"] <= 200

@@ -170,14 +170,15 @@ def test_alpha_hunter_maps_valid_bridge_response(monkeypatch):
         "reputation": "UNKNOWN",
     }
 
+    # Market data without source/update time is removed, not passed through.
     assert body["intelligence"]["wallet_activity"]["market"][
         "marketcap"
-    ] == 1000000.0
+    ] is None
 
-    assert (
-        body["intelligence"]["behavioral_findings"]["decision"]
-        == "WAIT"
-    )
+    # Scores and decisions are labeled as model outputs.
+    model = body["intelligence"]["behavioral_findings"]["model_scores"]
+    assert model["decision"] == "WAIT"
+    assert model["kind"] == "model_output"
 
     assert body["intelligence"]["concentration"] == {
         "top_10_percent": 42
@@ -186,16 +187,19 @@ def test_alpha_hunter_maps_valid_bridge_response(monkeypatch):
     assert body["intelligence"]["evidence"] == [
         {
             "source": "read-only-bridge",
+            "verification": "no_onchain_reference",
         }
     ]
 
-    assert body["data_quality"] == {
-        "status": "FRESH",
-        "limitations": [
-            "Bridge is read-only.",
-            "Creator reputation reported as UNKNOWN: no observed launch outcomes support a score.",
-        ],
-    }
+    assert body["data_quality"]["status"] == "FRESH"
+    assert body["data_quality"]["limitations"] == [
+        "Bridge is read-only.",
+        "Creator reputation reported as UNKNOWN: no observed launch outcomes support a score.",
+        "1 market data block(s) without source or update time removed.",
+        "Scores and decisions are model outputs, not observations.",
+        "Evidence items are recorded observations; verify each signature on a Solana "
+        "explorer unless marked onchain_confirmed.",
+    ]
 
 
 def test_alpha_hunter_preserves_null_concentration_empty_evidence_and_stale(
@@ -246,10 +250,11 @@ def test_alpha_hunter_preserves_null_concentration_empty_evidence_and_stale(
     assert body["intelligence"]["evidence"] == []
     assert body["data_quality"]["status"] == "STALE"
 
-    assert body["data_quality"]["limitations"] == [
+    assert body["data_quality"]["limitations"][:2] == [
         "Dados de mercado antigos: STALE.",
         "Creator reputation reported as UNKNOWN: no observed launch outcomes support a score.",
     ]
+    assert "1 market data block(s) without source or update time removed." in body["data_quality"]["limitations"]
 
 
 @pytest.mark.parametrize(
@@ -506,6 +511,7 @@ def test_false_fresh_cannot_be_billed(freshness, expected_status):
     payload = bridge_payload(
         freshness=freshness,
         creator={"profile": {"verified_launches": 2}},
+        behavioral_findings={"alerts": [], "explanation": "Creator has 2 observed launches."},
         evidence=[tx_evidence(WSOL_MINT)],
         data_quality={"status": "FRESH", "limitations": []},
     )
@@ -524,6 +530,7 @@ def test_consistent_freshness_with_traceable_behavior_remains_eligible():
             "stale_after_seconds": 60,
         },
         creator={"profile": {"verified_launches": 2}},
+        behavioral_findings={"alerts": [], "explanation": "Creator has 2 observed launches."},
         evidence=[tx_evidence(WSOL_MINT)],
         data_quality={"status": "FRESH", "limitations": []},
     )

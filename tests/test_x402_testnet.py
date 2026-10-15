@@ -428,6 +428,7 @@ class FixedProvider:
             intelligence=Intelligence(
                 creator=self.creator,
                 evidence=self.evidence,
+                behavioral_findings={"explanation": "Creator has 2 observed launches."},
             ),
             data_quality=DataQuality(status=self.quality),
         )

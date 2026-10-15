@@ -46,7 +46,7 @@ def sample(*, evidence=None, creator=None, wallet=None, findings=None,
             evidence=evidence if evidence is not None else [],
             creator=creator,
             wallet_activity=wallet if wallet is not None else {},
-            behavioral_findings=findings if findings is not None else {},
+            behavioral_findings=findings if findings is not None else {"explanation": EXPLAIN},
             concentration=concentration,
         ),
     )
@@ -56,6 +56,7 @@ def trace():
     return [tx_evidence(WSOL_MINT, source="Solana RPC")]
 
 
+EXPLAIN = "Creator launched 2 tokens observed on-chain."
 CREATOR = {"address": "creator-address", "profile": {"verified_launches": 2}}
 WALLET = {"profile": {"total_events": 4}}
 
@@ -104,6 +105,8 @@ def test_no_verifiable_provenance_denies(evidence):
     {"findings": {"scores": {"alpha_score": 99, "risk_score": 0}}},
     {"findings": {"decision": "WAIT", "explanation": None, "alerts": []}},
     {"concentration": {"top_10_percent": 55}},
+    # A generic explanation is not an observation.
+    {"findings": {"explanation": "On-chain wallet overlap observed across launches"}},
 ])
 def test_placeholder_or_unexplained_score_denies_payment(candidate):
     result = sample(evidence=trace(), **candidate)
@@ -117,8 +120,7 @@ def test_placeholder_or_unexplained_score_denies_payment(candidate):
     {"creator": {"profile": {"confirmed_outcomes": 1}}},
     {"wallet": WALLET},
     {"wallet": {"recent_events": [{"signature": signature("evt")}]}},
-    {"findings": {"alerts": [{"reason": "observed-wallet-cluster"}]}},
-    {"findings": {"explanation": "On-chain wallet overlap observed across launches"}},
+    {"findings": {"alerts": [{"reason": "observed-wallet-cluster"}], "explanation": EXPLAIN}},
 ])
 def test_provenance_plus_observed_finding_can_be_billable(candidate):
     assert billable(sample(evidence=trace(), **candidate))
@@ -189,3 +191,11 @@ def test_none_quality_denies_mainnet():
 
 def test_text_only_evidence_is_not_sufficient():
     assert not billable(sample(evidence=["verified onchain"], wallet=WALLET))
+
+
+def test_observation_without_explanation_is_not_premium():
+    from app.quality import REASON_NO_EXPLANATION
+
+    result = sample(evidence=trace(), creator=CREATOR, findings={"alerts": []})
+    assert not billable(result)
+    assert reasons(result) == [REASON_NO_EXPLANATION]

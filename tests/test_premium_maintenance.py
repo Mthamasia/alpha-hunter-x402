@@ -164,7 +164,7 @@ def test_free_preview_still_works_and_says_not_eligible_during_maintenance(monke
         "freshness": {"age_seconds": 30, "stale_after_seconds": 3600, "is_stale": False},
         "creator": {"address": "C", "profile": {"verified_launches": 2}},
         "wallet_activity": {"profile": {"total_events": 5}},
-        "behavioral_findings": {"alerts": [{"reason": "x"}]},
+        "behavioral_findings": {"alerts": [{"reason": "x"}], "explanation": "Observed alert."},
         "evidence": [tx_evidence(WSOL_MINT)],
         "data_quality": {"status": "FRESH", "limitations": []},
     }

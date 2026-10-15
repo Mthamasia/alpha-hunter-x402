@@ -111,6 +111,9 @@ class InvestigateResponse(BaseModel):
     generated_at: str
     intelligence: Intelligence
     data_quality: DataQuality
+    # Commercial eligibility of THIS response under the paid-evidence gate
+    # (app/quality.py). Under x402 Mainnet only eligible responses are sold.
+    eligibility: dict[str, Any] | None = None
 
 
 class PreviewResponse(BaseModel):
