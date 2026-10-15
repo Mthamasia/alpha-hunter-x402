@@ -361,3 +361,10 @@ or ongoing public uptime. No independent customer payment is documented.
 Alpha Hunter X intelligence is informational on-chain analysis, not investment,
 trading, legal, or financial advice. Data may be stale, incomplete, unavailable,
 or inaccurate. The service makes no promise of profit or outcome.
+
+## Commercial readiness (2026-10-15)
+
+- [Agent integration guide](docs/agent-integration.md): free preview, then pay only if `premium_eligible`.
+- [Required bridge evidence contract](docs/bridge-evidence-contract.md)
+- [Readiness report and GO/NO-GO verdict](docs/commercial-readiness-report-2026-10-15.md)
+- Operator metrics: `python scripts/telemetry_report.py $TELEMETRY_DB_PATH` (read-only).
