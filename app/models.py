@@ -106,3 +106,23 @@ class InvestigateResponse(BaseModel):
     generated_at: str
     intelligence: Intelligence
     data_quality: DataQuality
+
+
+class PreviewResponse(BaseModel):
+    """Free, limited summary: availability/freshness/data-quality only.
+
+    Deliberately excludes `intelligence` (creator, wallet_activity,
+    behavioral_findings, evidence) -- that is the premium payload sold on
+    `/v1/token/investigate`.
+    """
+
+    schema_version: str = SCHEMA_VERSION
+    request_id: str
+    chain: Literal["solana"]
+    mint: str
+    generated_at: str
+    available: bool
+    status: str
+    age_seconds: int | None = None
+    is_stale: bool | None = None
+    data_quality: DataQuality

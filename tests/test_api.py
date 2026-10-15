@@ -148,14 +148,27 @@ def test_public_service_index_and_x402_discovery(client):
     payload = manifest.json()
     assert payload["format"] == "ahx-discovery-v1"
     assert payload["resource"]["method"] == "POST"
-    assert len(payload["resources"]) == 1
-    offer = payload["resources"][0]
+    assert len(payload["resources"]) == 2
+    resources_by_path = {r["path"]: r for r in payload["resources"]}
+
+    offer = resources_by_path[URL]
     assert offer["method"] == "POST"
-    assert offer["path"] == URL
     assert offer["price_usd"] == "0.05"
+    assert offer["payment"]["required"] is True
     assert "creator" in offer["description"].lower()
     assert offer["input_schema"]["required"] == ["chain", "mint"]
     assert offer["input_schema"]["properties"]["chain"]["const"] == "solana"
+
+    preview = resources_by_path["/v1/token/preview"]
+    assert preview["price_usd"] == "0"
+    assert preview["payment"]["required"] is False
+    # The manifest tells agents what the free tier excludes, but never
+    # returns any premium data itself (verified at the HTTP layer in
+    # tests/test_preview.py).
+    assert "never creator" in preview["description"].lower()
+    assert preview["rate_limits"]["anonymous"]["per_minute"] > 0
+    assert preview["rate_limits"]["api_key"]["per_minute"] > preview["rate_limits"]["anonymous"]["per_minute"]
+
     assert payload["resource"]["path"] == URL
     assert payload["resource"]["example_request"]["chain"] == "solana"
     assert payload["payment"]["protocol"] == "x402"
