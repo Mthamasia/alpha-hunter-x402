@@ -360,9 +360,17 @@ def create_app(
         response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
         response.headers["Cache-Control"] = "no-store"
         # Loga apenas metadados; nunca headers/body (podem conter provas de pagamento).
+        latency_ms = (time.perf_counter() - started) * 1000
         logger.info("%s %s -> %s rid=%s latency_ms=%.1f", request.method, request.url.path,
-                    response.status_code, request.state.request_id,
-                    (time.perf_counter() - started) * 1000)
+                    response.status_code, request.state.request_id, latency_ms)
+        if getattr(request.state, "query", None) is not None or request.url.path in (
+            "/v1/token/investigate", "/v1/token/preview"
+        ):
+            try:
+                cost_ledger.set_outcome(request.state.request_id, latency_ms=latency_ms,
+                                        http_status=response.status_code)
+            except Exception:
+                logger.warning("latency telemetry failed rid=%s", request.state.request_id)
         return response
 
     @app.exception_handler(RequestValidationError)

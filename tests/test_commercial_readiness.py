@@ -605,3 +605,19 @@ def test_paid_response_states_its_eligibility(monkeypatch):
     e = paid(client).json()["eligibility"]
     assert e["premium_eligible"] is True and e["reasons"] == []
     assert 0 <= e["newest_evidence_age_seconds"] <= 200
+
+
+def test_report_has_latency_percentiles_eligibility_and_margin(monkeypatch, tmp_path):
+    from scripts.telemetry_report import report
+
+    state = {"payload": good_payload()}
+    client, _, _ = build(monkeypatch, lambda _u: httpx.Response(200, json=state["payload"]), **_paths(tmp_path))
+    assert paid(client).status_code == 200
+    state["payload"] = good_payload(evidence=[])
+    assert paid(client).status_code == 503
+    out = report(str(tmp_path / "telemetry.db"))
+    assert out["latency_by_route"]["investigate"]["n"] == 2
+    assert out["latency_by_route"]["investigate"]["p95_ms"] >= out["latency_by_route"]["investigate"]["p50_ms"] > 0
+    assert out["investigate_answered"] == 2
+    assert out["investigate_eligible_rate"] == 0.5
+    assert out["helius_calls_total"] == 0

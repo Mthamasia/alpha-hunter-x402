@@ -28,13 +28,33 @@ def report(db_path: str, since: str | None = None) -> dict:
             out[str(r[key])] = out.get(str(r[key]), 0) + 1
         return dict(sorted(out.items()))
 
+    keys = rows[0].keys() if rows else []
     settled = [r for r in rows if r["revenue_kind"] == "settled"]
     agents = {r["agent_id"] for r in rows if r["agent_id"]}
-    keys = rows[0].keys() if rows else []
     payers = {r["payer"] for r in settled if "payer" in keys and r["payer"]}
     paying_agents = {r["agent_id"] for r in settled if r["agent_id"]}
+    def pct(values, q):
+        values = sorted(v for v in values if v is not None)
+        if not values:
+            return None
+        return values[min(len(values) - 1, int(round(q * (len(values) - 1))))]
+
+    latency = {}
+    for route in sorted({r["route"] for r in rows}):
+        lat = [r["latency_ms"] for r in rows if r["route"] == route and "latency_ms" in keys]
+        latency[route] = {"p50_ms": pct(lat, 0.50), "p95_ms": pct(lat, 0.95), "n": len([x for x in lat if x is not None])}
+    inv = [r for r in rows if r["route"] == "investigate" and r["served_from"] in ("bridge", "stub")]
+    statuses = [r["http_status"] for r in inv if "http_status" in keys and r["http_status"] is not None]
+    eligible = sum(1 for s_ in statuses if s_ == 200)
+    cost = [Decimal(r["cost_usd_estimated"]) for r in settled if r["cost_usd_estimated"] is not None]
+    revenue = sum((Decimal(r["revenue_usd"]) for r in settled), Decimal("0"))
     return {
         "since": since,
+        "latency_by_route": latency,
+        "investigate_answered": len(statuses),
+        "investigate_eligible_rate": (round(eligible / len(statuses), 4) if statuses else None),
+        "incremental_cost_usd_settled": str(sum(cost, Decimal("0"))) if len(cost) == len(settled) else None,
+        "incremental_margin_usd_settled": str(revenue - sum(cost, Decimal("0"))) if len(cost) == len(settled) else None,
         "queries": len(rows),
         "by_route": count("route"),
         "by_served_from": count("served_from"),

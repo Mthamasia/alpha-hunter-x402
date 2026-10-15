@@ -368,9 +368,10 @@ class CostLedger:
             # payer address is the only authenticated customer identity a
             # paid call has; X-Agent-Id remains an unauthenticated label.
             existing = {row[1] for row in conn.execute("PRAGMA table_info(query_costs)")}
-            for column in ("payer", "settlement_tx"):
+            for column, kind in (("payer", "TEXT"), ("settlement_tx", "TEXT"),
+                                 ("latency_ms", "REAL"), ("http_status", "INTEGER")):
                 if column not in existing:
-                    conn.execute(f"ALTER TABLE query_costs ADD COLUMN {column} TEXT")
+                    conn.execute(f"ALTER TABLE query_costs ADD COLUMN {column} {kind}")
 
     def _connect(self) -> sqlite3.Connection:
         # `Connection.__enter__`/`__exit__` only commit/rollback the
@@ -447,6 +448,15 @@ class CostLedger:
                 ),
             )
             return True
+
+    def set_outcome(self, request_id: str, *, latency_ms: float, http_status: int) -> None:
+        """End-to-end latency and final HTTP status, written after the
+        response is complete (so it includes settlement time)."""
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE query_costs SET latency_ms = ?, http_status = ? WHERE request_id = ?",
+                (round(latency_ms, 1), http_status, request_id),
+            )
 
     def purge_older_than(self, cutoff_iso: str) -> int:
         """Retention: deletes rows older than `cutoff_iso` (ISO-8601,
